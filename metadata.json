@@ -1,0 +1,6 @@
+{
+  "name": "PureStream",
+  "description": "Trình phát YouTube tối giản không quảng cáo, hỗ trợ nghe âm thanh nền khi tắt màn hình và tự động bỏ qua đoạn tài trợ SponsorBlock trên mọi thiết bị.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
