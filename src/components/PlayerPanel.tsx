@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   ChevronDown,
   Headphones,
   Heart,
@@ -10,6 +11,7 @@ import {
   Pause,
   PictureInPicture2,
   Play,
+  RefreshCw,
   Repeat,
   Repeat1,
   RotateCcw,
@@ -41,6 +43,7 @@ interface PlayerPanelProps {
   playMode: PlayMode;
   activeEngine: ActiveEngine;
   streamSourceLabel: string | null;
+  isRetryingNative?: boolean;
   isPiPSupported: boolean;
   isPlaying: boolean;
   isLoading: boolean;
@@ -66,6 +69,7 @@ interface PlayerPanelProps {
   onSeek: (seconds: number) => void;
   onSkipBy: (delta: number) => void;
   onSwitchPlayMode: (mode: PlayMode) => void;
+  onRetryNativeStream?: () => void;
   onTogglePiP: () => void;
   onVolumeChange: (val: number) => void;
   onToggleMute: () => void;
@@ -88,6 +92,7 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
   playMode,
   activeEngine,
   streamSourceLabel,
+  isRetryingNative = false,
   isPiPSupported,
   isPlaying,
   isLoading,
@@ -113,6 +118,7 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
   onSeek,
   onSkipBy,
   onSwitchPlayMode,
+  onRetryNativeStream,
   onTogglePiP,
   onVolumeChange,
   onToggleMute,
@@ -147,7 +153,9 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
   // Report live bounding rect of the video slot so the persistent YT player aligns with 0ms reload
   useEffect(() => {
     if (!onVideoSlotRectChange) return;
-    const isVisibleSlot = Boolean(currentTrack && playMode === 'video' && panelTab === 'player');
+    const isVisibleSlot = Boolean(
+      currentTrack && (playMode === 'video' || activeEngine === 'yt-privacy') && panelTab === 'player'
+    );
     if (!isVisibleSlot || !videoSlotRef.current) {
       onVideoSlotRectChange(null);
       return;
@@ -176,7 +184,7 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
       window.removeEventListener('scroll', update, true);
       onVideoSlotRectChange(null);
     };
-  }, [currentTrack, onVideoSlotRectChange, panelTab, playMode]);
+  }, [activeEngine, currentTrack, onVideoSlotRectChange, panelTab, playMode]);
 
   if (!currentTrack) {
     return (
@@ -198,7 +206,7 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
     <div className="flex h-full flex-col bg-white dark:bg-[#0F1217]">
       {/* Mobile sheet header */}
       {isMobileSheet ? (
-        <div className="shrink-0 px-4 pt-3 pb-2">
+        <div className="shrink-0 px-4 pt-safe-header pb-2">
           <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-slate-300 dark:bg-white/20" />
           <div className="flex items-center justify-between gap-3">
             <button
@@ -321,15 +329,15 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
                 className="relative aspect-video w-full overflow-hidden rounded-2xl bg-black shadow-lg"
               />
             ) : (
-              <div className="relative mx-auto w-full max-w-[340px]">
+              <div ref={videoSlotRef} className="relative mx-auto w-full max-w-[340px]">
                 <TrackThumbnail
                   src={currentTrack.thumbnail}
                   alt={currentTrack.title}
                   aspect="video"
-                  className="w-full rounded-2xl shadow-xl shadow-black/25"
+                  className="relative z-[46] w-full rounded-2xl shadow-xl shadow-black/25"
                 />
                 {isLoading && (
-                  <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/45">
+                  <div className="absolute inset-0 z-[47] flex items-center justify-center rounded-2xl bg-black/45">
                     <Loader2 className="h-7 w-7 animate-spin text-white" />
                   </div>
                 )}
@@ -389,6 +397,33 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
                 </button>
               </div>
             </div>
+
+            {/* Clear inline warning when falling back to YouTube iframe */}
+            {activeEngine === 'yt-privacy' && (
+              <div className="mt-3.5 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs text-amber-900 dark:text-amber-200">
+                <div className="flex min-w-0 flex-1 items-start gap-2">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                  <p className="leading-relaxed">
+                    Đang phát qua iframe dự phòng: iPhone Safari sẽ tạm dừng khi tắt màn hình.
+                  </p>
+                </div>
+                {onRetryNativeStream && (
+                  <button
+                    type="button"
+                    disabled={isRetryingNative}
+                    onClick={onRetryNativeStream}
+                    className="inline-flex min-h-[44px] shrink-0 items-center gap-1.5 rounded-lg bg-amber-600 px-3 py-2 text-xs font-semibold text-white hover:bg-amber-700 disabled:opacity-60 transition-colors whitespace-nowrap"
+                  >
+                    {isRetryingNative ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3.5 w-3.5" />
+                    )}
+                    <span>{isRetryingNative ? 'Đang thử...' : 'Thử lấy luồng gốc'}</span>
+                  </button>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Controls Block */}

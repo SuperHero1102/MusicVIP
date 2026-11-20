@@ -5,7 +5,21 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Readable } from 'stream';
 import yts from 'yt-search';
-import { Innertube } from 'youtubei.js';
+import { Innertube, Log, Platform } from 'youtubei.js';
+import { JSDOM } from 'jsdom';
+import { BotGuardClient, getChallenge } from 'bgutils-js/botguard';
+import { WebPoMinter } from 'bgutils-js/webpo';
+import { buildURL, getHeaders } from 'bgutils-js/utils';
+
+Log.setLevel(Log.Level.NONE);
+
+Platform.shim.eval = async (data, env) => {
+  const props: string[] = [];
+  if (env.n) props.push(`n: exportedVars.nFunction(${JSON.stringify(env.n)})`);
+  if (env.sig) props.push(`sig: exportedVars.sigFunction(${JSON.stringify(env.sig)})`);
+  if (props.length === 0) return {};
+  return new Function(`${data.output}\nreturn { ${props.join(', ')} };`)() as Record<string, unknown>;
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -51,12 +65,139 @@ const sponsorCache = new Map<
   CacheEntry<Array<{ uuid: string; category: string; start: number; end: number }>>
 >();
 
+const WEBPO_REQUEST_KEY = 'O43z0dpjhgX20SCx4KAo';
+
+interface PoMinterEntry {
+  minter: WebPoMinter;
+  expiresAt: number;
+}
+
+let poDom: JSDOM | null = null;
+let poMinterEntry: PoMinterEntry | null = null;
+let poMinterPromise: Promise<PoMinterEntry | null> | null = null;
+
+async function getPoMinter(): Promise<WebPoMinter | null> {
+  if (poMinterEntry && poMinterEntry.expiresAt > Date.now()) {
+    return poMinterEntry.minter;
+  }
+  if (poMinterPromise) {
+    const res = await poMinterPromise;
+    return res?.minter ?? null;
+  }
+
+  poMinterPromise = (async () => {
+    try {
+      if (!poDom) {
+        poDom = new JSDOM('<!doctype html><html><body></body></html>', {
+          url: 'https://www.youtube.com/',
+        });
+      }
+      const g = globalThis as Record<string, unknown>;
+      if (!g.window) g.window = poDom.window;
+      if (!g.document) g.document = poDom.window.document;
+
+      const challenge = await getChallenge({
+        requestKey: WEBPO_REQUEST_KEY,
+        fetchFunction: fetch,
+        useYouTubeAPI: true,
+      });
+
+      let scriptTxt =
+        challenge.interpreterJavascript?.privateDoNotAccessOrElseSafeScriptWrappedValue;
+      if (!scriptTxt && challenge.interpreterUrl?.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue) {
+        const rawUrl =
+          challenge.interpreterUrl.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue;
+        const fullUrl = rawUrl.startsWith('//') ? `https:${rawUrl}` : rawUrl;
+        const scriptResp = await fetch(fullUrl);
+        if (scriptResp.ok) {
+          scriptTxt = await scriptResp.text();
+        }
+      }
+      if (!scriptTxt || !challenge.program || !challenge.globalName) {
+        return null;
+      }
+
+      // Execute interpreter in Node global realm so WebPoMinter callback passes instanceof Function
+      new Function(scriptTxt)();
+
+      const bgClient = await BotGuardClient.create({
+        globalName: challenge.globalName,
+        globalObject: globalThis,
+        program: challenge.program,
+      });
+
+      const webPoSignalOutput: Parameters<typeof WebPoMinter.create>[1] = [];
+      const bgResponse = await bgClient.snapshot({ webPoSignalOutput });
+
+      const itResp = await fetch(buildURL('GenerateIT', true), {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify([WEBPO_REQUEST_KEY, bgResponse]),
+      });
+      if (!itResp.ok) {
+        return null;
+      }
+
+      const itJson = (await itResp.json()) as [string?, number?, number?, string?];
+      const [integrityToken, estimatedTtlSecs, mintRefreshThreshold, websafeFallbackToken] =
+        itJson;
+      if (!integrityToken) {
+        return null;
+      }
+
+      const minter = await WebPoMinter.create(
+        {
+          integrityToken,
+          estimatedTtlSecs,
+          mintRefreshThreshold,
+          websafeFallbackToken,
+        },
+        webPoSignalOutput
+      );
+
+      const ttlSecs = Math.max(120, Math.min(21_600, (estimatedTtlSecs || 3600) - 120));
+      const entry: PoMinterEntry = {
+        minter,
+        expiresAt: Date.now() + ttlSecs * 1000,
+      };
+      poMinterEntry = entry;
+      return entry;
+    } catch (err) {
+      console.warn('[media] PoToken minter init skipped:', (err as Error).message);
+      return null;
+    } finally {
+      poMinterPromise = null;
+    }
+  })();
+
+  const res = await poMinterPromise;
+  return res?.minter ?? null;
+}
+
+async function mintVideoPoToken(videoId: string): Promise<string | undefined> {
+  if (process.env.YOUTUBE_PO_TOKEN) {
+    return process.env.YOUTUBE_PO_TOKEN;
+  }
+  try {
+    const minter = await Promise.race([
+      getPoMinter(),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 2600)),
+    ]);
+    if (!minter) return undefined;
+    return await minter.mintAsWebsafeString(videoId);
+  } catch {
+    return undefined;
+  }
+}
+
 let innertubePromise: Promise<Innertube> | null = null;
 function getInnertube(): Promise<Innertube> {
   if (!innertubePromise) {
     innertubePromise = Innertube.create({
-      retrieve_player: false,
+      retrieve_player: true,
       cookie: process.env.YOUTUBE_COOKIE || undefined,
+      po_token: process.env.YOUTUBE_PO_TOKEN || undefined,
+      visitor_data: process.env.YOUTUBE_VISITOR_DATA || undefined,
     }).catch((err) => {
       innertubePromise = null;
       throw err;
@@ -65,8 +206,9 @@ function getInnertube(): Promise<Innertube> {
   return innertubePromise;
 }
 
-// Pre-warm Innertube session on server boot so first track resolves fast
+// Pre-warm Innertube session + PoToken minter on server boot so first track resolves fast
 void getInnertube().catch(() => {});
+void getPoMinter().catch(() => {});
 
 function formatDuration(seconds: number): string {
   if (!seconds || seconds <= 0 || !Number.isFinite(seconds)) return '0:00';
@@ -167,41 +309,179 @@ async function searchYouTubeTracks(query: string): Promise<TrackDTO[]> {
         publishedText: v.ago || '',
       }));
 
-    searchCache.set(key, { data: tracks, expiresAt: Date.now() + 10 * 60_000 });
-    return tracks;
-  } catch (err) {
-    console.warn('[search] yt-search failed, falling back to youtubei.js:', (err as Error).message);
-    const yt = await getInnertube();
-    const res = await yt.search(query, { type: 'video' });
-    const tracks: TrackDTO[] = [];
-    for (const item of res.videos || []) {
-      const anyItem = item as unknown as Record<string, unknown>;
-      const id = typeof anyItem.id === 'string' ? anyItem.id : '';
-      if (!id) continue;
-      const titleObj = anyItem.title as { toString?: () => string } | undefined;
-      const authorObj = anyItem.author as { name?: string } | undefined;
-      const durObj = anyItem.duration as { seconds?: number; text?: string } | undefined;
-      const thumbs = anyItem.thumbnails as Array<{ url: string }> | undefined;
-      tracks.push({
-        id,
-        title: titleObj?.toString?.() || 'YouTube Audio',
-        author: authorObj?.name || 'YouTube',
-        thumbnail: thumbs?.[0]?.url || `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
-        durationSeconds: durObj?.seconds || 0,
-        durationText: durObj?.text || formatDuration(durObj?.seconds || 0),
-        viewsText: '',
-        publishedText: '',
-      });
-      if (tracks.length >= 20) break;
+    if (tracks.length > 0) {
+      searchCache.set(key, { data: tracks, expiresAt: Date.now() + 10 * 60_000 });
+      return tracks;
     }
+  } catch {
+    // Fall back to youtubei.js
+  }
+
+  const yt = await getInnertube();
+  const res = await yt.search(query, { type: 'video' });
+  const tracks: TrackDTO[] = [];
+  for (const item of res.videos || []) {
+    const anyItem = item as unknown as Record<string, unknown>;
+    const id = typeof anyItem.id === 'string' ? anyItem.id : '';
+    if (!id) continue;
+    const titleObj = anyItem.title as { toString?: () => string } | undefined;
+    const authorObj = anyItem.author as { name?: string } | undefined;
+    const durObj = anyItem.duration as { seconds?: number; text?: string } | undefined;
+    const thumbs = anyItem.thumbnails as Array<{ url: string }> | undefined;
+    tracks.push({
+      id,
+      title: titleObj?.toString?.() || 'YouTube Audio',
+      author: authorObj?.name || 'YouTube',
+      thumbnail: thumbs?.[0]?.url || `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+      durationSeconds: durObj?.seconds || 0,
+      durationText: durObj?.text || formatDuration(durObj?.seconds || 0),
+      viewsText: '',
+      publishedText: '',
+    });
+    if (tracks.length >= 20) break;
+  }
+  if (tracks.length > 0) {
     searchCache.set(key, { data: tracks, expiresAt: Date.now() + 10 * 60_000 });
-    return tracks;
+  }
+  return tracks;
+}
+
+type InnertubeClientName = NonNullable<
+  NonNullable<Parameters<Innertube['getBasicInfo']>[1]>['client']
+>;
+
+async function resolveFormatUrl(
+  format: {
+    url?: string;
+    signature_cipher?: string;
+    cipher?: string;
+    decipher?: (player?: Innertube['session']['player']) => Promise<string>;
+  },
+  yt: Innertube
+): Promise<string | null> {
+  if (format.url) return format.url;
+  if ((format.signature_cipher || format.cipher) && typeof format.decipher === 'function' && yt.session.player) {
+    try {
+      const deciphered = await format.decipher(yt.session.player);
+      return deciphered || null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+async function verifyStreamUrl(url: string): Promise<boolean> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 2500);
+  try {
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: { Range: 'bytes=0-0' },
+      signal: ctrl.signal,
+    });
+    if (resp.body) {
+      void resp.body.cancel().catch(() => {});
+    }
+    return resp.status === 200 || resp.status === 206;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
+async function extractFromClients(
+  yt: Innertube,
+  videoId: string,
+  clients: InnertubeClientName[],
+  poToken?: string
+): Promise<{
+  audio: StreamDescriptor | null;
+  video: StreamDescriptor | null;
+  botCheckBlocked: boolean;
+}> {
+  let audio: StreamDescriptor | null = null;
+  let video: StreamDescriptor | null = null;
+  let botCheckBlocked = false;
+
+  const settled = await Promise.allSettled(
+    clients.map(async (client) => {
+      const info = await yt.getBasicInfo(videoId, {
+        client,
+        ...(poToken ? { po_token: poToken } : {}),
+      });
+      return { client, info };
+    })
+  );
+
+  for (const res of settled) {
+    if (res.status !== 'fulfilled') continue;
+    const { client, info } = res.value;
+    const status = info.playability_status?.status;
+    if (status === 'LOGIN_REQUIRED') {
+      botCheckBlocked = true;
+    }
+
+    if (!audio) {
+      const adaptiveCandidates = (info.streaming_data?.adaptive_formats || [])
+        .filter((f) => f.has_audio && !f.has_video && (f.url || f.signature_cipher || f.cipher))
+        .sort((a, b) => {
+          const aMp4 = a.mime_type?.includes('audio/mp4') ? 1 : 0;
+          const bMp4 = b.mime_type?.includes('audio/mp4') ? 1 : 0;
+          if (aMp4 !== bMp4) return bMp4 - aMp4;
+          return (b.bitrate || 0) - (a.bitrate || 0);
+        });
+
+      for (const candidate of adaptiveCandidates.slice(0, 2)) {
+        const mime = (candidate.mime_type || '').split(';')[0];
+        // Prefer AAC/MP4 audio for universal iOS Safari background compatibility
+        if (!mime.includes('mp4')) continue;
+        const url = await resolveFormatUrl(candidate, yt);
+        if (url && (await verifyStreamUrl(url))) {
+          audio = {
+            url,
+            mimeType: mime || 'audio/mp4',
+            contentLength: candidate.content_length ? Number(candidate.content_length) : undefined,
+            source: `youtubei-${client.toLowerCase()}`,
+          };
+          break;
+        }
+      }
+    }
+
+    if (!video) {
+      const muxedCandidates = (info.streaming_data?.formats || [])
+        .filter((f) => f.has_video && f.has_audio && (f.url || f.signature_cipher || f.cipher))
+        .sort((a, b) => {
+          const aMp4 = a.mime_type?.includes('video/mp4') ? 1 : 0;
+          const bMp4 = b.mime_type?.includes('video/mp4') ? 1 : 0;
+          if (aMp4 !== bMp4) return bMp4 - aMp4;
+          return (b.height || 0) - (a.height || 0);
+        });
+
+      for (const candidate of muxedCandidates.slice(0, 2)) {
+        const url = await resolveFormatUrl(candidate, yt);
+        if (url && (await verifyStreamUrl(url))) {
+          video = {
+            url,
+            mimeType: (candidate.mime_type || 'video/mp4').split(';')[0],
+            quality: candidate.quality_label || `${candidate.height || 360}p`,
+            contentLength: candidate.content_length ? Number(candidate.content_length) : undefined,
+            source: `youtubei-${client.toLowerCase()}`,
+          };
+          break;
+        }
+      }
+    }
+  }
+
+  return { audio, video, botCheckBlocked };
+}
+
 /**
- * Extracts BOTH real direct ad-free audio/mp4 (via IOS client)
- * AND real direct ad-free muxed video/mp4 (via ANDROID client) using youtubei.js.
+ * Extracts BOTH real direct ad-free audio/mp4 AND muxed video/mp4
+ * using multi-client Innertube + BotGuard PoToken + JS player signature deciphering.
  */
 async function resolveMediaBundle(videoId: string): Promise<CachedMediaBundle> {
   const cached = mediaBundleCache.get(videoId);
@@ -214,89 +494,34 @@ async function resolveMediaBundle(videoId: string): Promise<CachedMediaBundle> {
   let botCheckBlocked = false;
 
   try {
-    const yt = await getInnertube();
+    const [yt, poToken] = await Promise.all([getInnertube(), mintVideoPoToken(videoId)]);
 
-    const [iosResult, androidResult] = await Promise.allSettled([
-      yt.getBasicInfo(videoId, { client: 'IOS' }),
-      yt.getBasicInfo(videoId, { client: 'ANDROID' }),
-    ]);
+    const batch1 = await extractFromClients(
+      yt,
+      videoId,
+      ['IOS', 'ANDROID', 'ANDROID_VR', 'TV'],
+      poToken
+    );
+    audio = batch1.audio;
+    video = batch1.video;
+    botCheckBlocked = batch1.botCheckBlocked;
 
-    // Extract direct audio/mp4 (AAC/M4A for universal iOS Safari + Android + Desktop background playback)
-    if (iosResult.status === 'fulfilled') {
-      const info = iosResult.value;
-      const status = info.playability_status?.status;
-      if (status === 'LOGIN_REQUIRED') {
-        botCheckBlocked = true;
-      }
-      const adaptive = (info.streaming_data?.adaptive_formats || []).filter(
-        (f) => f.has_audio && !f.has_video && Boolean(f.url)
+    // If primary mobile/TV clients didn't yield both audio and video, try web/mweb/embedded with deciphering + PoToken
+    if (!audio || !video) {
+      const batch2 = await extractFromClients(
+        yt,
+        videoId,
+        ['MWEB', 'WEB', 'WEB_EMBEDDED'],
+        poToken
       );
-      adaptive.sort((a, b) => {
-        const aMp4 = a.mime_type?.includes('audio/mp4') ? 1 : 0;
-        const bMp4 = b.mime_type?.includes('audio/mp4') ? 1 : 0;
-        if (aMp4 !== bMp4) return bMp4 - aMp4;
-        return (b.bitrate || 0) - (a.bitrate || 0);
-      });
-      const bestAudio = adaptive[0];
-      if (bestAudio?.url) {
-        audio = {
-          url: bestAudio.url,
-          mimeType: (bestAudio.mime_type || 'audio/mp4').split(';')[0],
-          contentLength: bestAudio.content_length ? Number(bestAudio.content_length) : undefined,
-          source: 'youtubei-ios',
-        };
-      }
+      if (!audio && batch2.audio) audio = batch2.audio;
+      if (!video && batch2.video) video = batch2.video;
+      botCheckBlocked = botCheckBlocked || batch2.botCheckBlocked;
     }
 
-    // Extract direct muxed video/mp4 (ad-free native <video> stream)
-    if (androidResult.status === 'fulfilled') {
-      const info = androidResult.value;
-      const status = info.playability_status?.status;
-      if (status === 'LOGIN_REQUIRED') {
-        botCheckBlocked = true;
-      }
-      const muxed = (info.streaming_data?.formats || []).filter(
-        (f) => f.has_video && f.has_audio && Boolean(f.url)
-      );
-      muxed.sort((a, b) => {
-        const aMp4 = a.mime_type?.includes('video/mp4') ? 1 : 0;
-        const bMp4 = b.mime_type?.includes('video/mp4') ? 1 : 0;
-        if (aMp4 !== bMp4) return bMp4 - aMp4;
-        return (b.height || 0) - (a.height || 0);
-      });
-      const bestVideo = muxed[0];
-      if (bestVideo?.url) {
-        video = {
-          url: bestVideo.url,
-          mimeType: (bestVideo.mime_type || 'video/mp4').split(';')[0],
-          quality: bestVideo.quality_label || `${bestVideo.height || 360}p`,
-          contentLength: bestVideo.content_length ? Number(bestVideo.content_length) : undefined,
-          source: 'youtubei-android',
-        };
-      }
-
-      // If IOS audio wasn't found, check ANDROID adaptive audio too
-      if (!audio) {
-        const androidAudio = (info.streaming_data?.adaptive_formats || [])
-          .filter((f) => f.has_audio && !f.has_video && Boolean(f.url))
-          .sort((a, b) => {
-            const aMp4 = a.mime_type?.includes('audio/mp4') ? 1 : 0;
-            const bMp4 = b.mime_type?.includes('audio/mp4') ? 1 : 0;
-            if (aMp4 !== bMp4) return bMp4 - aMp4;
-            return (b.bitrate || 0) - (a.bitrate || 0);
-          })[0];
-        if (androidAudio?.url) {
-          audio = {
-            url: androidAudio.url,
-            mimeType: (androidAudio.mime_type || 'audio/mp4').split(';')[0],
-            contentLength: androidAudio.content_length ? Number(androidAudio.content_length) : undefined,
-            source: 'youtubei-android',
-          };
-        } else if (video) {
-          // Muxed mp4 also works cleanly as audio fallback
-          audio = { ...video, source: 'youtubei-android-muxed' };
-        }
-      }
+    // Muxed MP4 also plays reliably inside iOS native <audio> when adaptive M4A is absent
+    if (!audio && video) {
+      audio = { ...video, source: `${video.source}-muxed` };
     }
   } catch (err) {
     console.warn('[media] Innertube resolution error:', (err as Error).message);
@@ -306,7 +531,7 @@ async function resolveMediaBundle(videoId: string): Promise<CachedMediaBundle> {
     audio,
     video,
     botCheckBlocked: !audio && !video && botCheckBlocked,
-    expiresAt: Date.now() + (audio || video ? 25 * 60_000 : 3 * 60_000),
+    expiresAt: Date.now() + (audio || video ? 25 * 60_000 : 2 * 60_000),
   };
   mediaBundleCache.set(videoId, bundle);
   return bundle;
@@ -337,8 +562,21 @@ async function proxyRangeMedia(
     forwardHeaders.Range = req.headers.range;
   }
 
+  const isHead = req.method === 'HEAD';
+  // googlevideo signed URLs reject HTTP HEAD with 403; probe 1 byte via GET for HEAD requests
+  if (isHead && !forwardHeaders.Range) {
+    forwardHeaders.Range = 'bytes=0-0';
+  }
+
   try {
     let upstream = await fetch(descriptor.url, { headers: forwardHeaders });
+
+    // Some non-iOS client URLs (e.g. ANDROID/ANDROID_VR) reject mismatched mobile UA; retry without custom UA first
+    if (upstream.status === 403) {
+      const minimalHeaders: Record<string, string> = {};
+      if (forwardHeaders.Range) minimalHeaders.Range = forwardHeaders.Range;
+      upstream = await fetch(descriptor.url, { headers: minimalHeaders });
+    }
 
     // Retry once with fresh extraction if signed URL expired
     if (upstream.status === 403 || upstream.status === 410) {
@@ -357,7 +595,10 @@ async function proxyRangeMedia(
       return;
     }
 
-    res.status(upstream.status);
+    const contentRange = upstream.headers.get('content-range');
+    const contentLength = upstream.headers.get('content-length');
+
+    res.status(isHead && !req.headers.range ? 200 : upstream.status);
     res.setHeader(
       'Content-Type',
       upstream.headers.get('content-type') ||
@@ -367,12 +608,22 @@ async function proxyRangeMedia(
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'no-store');
 
-    const contentLength = upstream.headers.get('content-length');
-    if (contentLength) res.setHeader('Content-Length', contentLength);
-    const contentRange = upstream.headers.get('content-range');
-    if (contentRange) res.setHeader('Content-Range', contentRange);
+    if (isHead && !req.headers.range && contentRange) {
+      const totalMatch = contentRange.match(/\/(\d+)$/);
+      if (totalMatch?.[1]) {
+        res.setHeader('Content-Length', totalMatch[1]);
+      } else if (descriptor.contentLength) {
+        res.setHeader('Content-Length', String(descriptor.contentLength));
+      }
+    } else {
+      if (contentLength) res.setHeader('Content-Length', contentLength);
+      if (contentRange) res.setHeader('Content-Range', contentRange);
+    }
 
-    if (!upstream.body) {
+    if (isHead || !upstream.body) {
+      if (upstream.body) {
+        void upstream.body.cancel().catch(() => {});
+      }
       res.end();
       return;
     }

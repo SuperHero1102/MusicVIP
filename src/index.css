@@ -75,3 +75,21 @@ input[type="range"].pure-range::-moz-range-thumb {
 .pb-safe {
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
+
+@layer utilities {
+  .pt-safe-header {
+    padding-top: calc(env(safe-area-inset-top, 0px) + 12px);
+  }
+
+  .mini-player-bottom {
+    bottom: calc(60px + env(safe-area-inset-bottom, 0px) + 10px);
+  }
+
+  .main-pb-nav {
+    padding-bottom: calc(84px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .main-pb-miniplayer {
+    padding-bottom: calc(176px + env(safe-area-inset-bottom, 0px));
+  }
+}

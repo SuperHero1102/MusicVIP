@@ -46,7 +46,7 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({ compact = fa
             <div className="w-full max-w-sm rounded-2xl bg-white dark:bg-[#14171D] border border-slate-200 dark:border-white/10 p-6 shadow-2xl">
               <div className="flex items-center justify-between">
                 <h3 className="text-base font-semibold text-slate-900 dark:text-white">
-                  Cài PureStream trên iPhone / iPad
+                  Cài Music Tube trên iPhone / iPad
                 </h3>
                 <button
                   type="button"

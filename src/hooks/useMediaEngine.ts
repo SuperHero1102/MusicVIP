@@ -10,6 +10,11 @@ import {
 
 export type ActiveEngine = 'native-audio' | 'native-video' | 'yt-privacy';
 
+const MAX_RECOVERY_ATTEMPTS = 3;
+const STALL_WATCHDOG_MS = 3000;
+const SILENT_WAV_DATA_URI =
+  'data:audio/wav;base64,UklGRjIAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQgAAAAAAAAAAAAAAA==';
+
 interface ResolvedMediaUrls {
   audioUrl: string | null;
   videoUrl: string | null;
@@ -78,20 +83,84 @@ function loadYouTubeIframeAPI(): Promise<void> {
   return ytApiPromise;
 }
 
+function appendCacheBusterIfLocal(url: string | null): string | null {
+  if (!url) return null;
+  if (!url.startsWith('/api/')) return url;
+  const base = url.split('?')[0];
+  return `${base}?r=${Date.now()}`;
+}
+
+const PIPED_HOSTS = [
+  'https://pipedapi.ducks.party',
+  'https://api.piped.private.coffee',
+  'https://pipedapi.reallyaweso.me',
+  'https://pipedapi.leptons.xyz',
+  'https://pipedapi.kavin.rocks',
+];
+
+const INVIDIOUS_FALLBACK_HOSTS = [
+  'https://inv.nadeko.net',
+  'https://invidious.nerdvpn.de',
+];
+
+let cachedInvidiousHosts: string[] | null = null;
+let invidiousDiscoveryPromise: Promise<string[]> | null = null;
+
+async function getInvidiousHosts(): Promise<string[]> {
+  if (cachedInvidiousHosts) return cachedInvidiousHosts;
+  if (invidiousDiscoveryPromise) return invidiousDiscoveryPromise;
+
+  invidiousDiscoveryPromise = (async () => {
+    const ctrl = new AbortController();
+    const timer = window.setTimeout(() => ctrl.abort(), 1800);
+    try {
+      const resp = await fetch('https://api.invidious.io/instances.json?sort_by=type,health', {
+        signal: ctrl.signal,
+      });
+      if (!resp.ok) throw new Error('invidious-list-failed');
+      const entries = (await resp.json()) as Array<
+        [string, { type?: string; cors?: boolean; api?: boolean; uri?: string }]
+      >;
+      const discovered = entries
+        .filter(([, meta]) => meta?.type === 'https' && meta?.cors === true && meta?.api === true && meta?.uri)
+        .slice(0, 4)
+        .map(([, meta]) => meta.uri!.replace(/\/$/, ''));
+      const merged = Array.from(new Set([...discovered, ...INVIDIOUS_FALLBACK_HOSTS]));
+      cachedInvidiousHosts = merged;
+      return merged;
+    } catch {
+      cachedInvidiousHosts = INVIDIOUS_FALLBACK_HOSTS;
+      return INVIDIOUS_FALLBACK_HOSTS;
+    } finally {
+      window.clearTimeout(timer);
+      invidiousDiscoveryPromise = null;
+    }
+  })();
+
+  return invidiousDiscoveryPromise;
+}
+
+function isAppleTouchBrowser(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  return (
+    /iPad|iPhone|iPod/i.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+  );
+}
+
 /**
  * Tier-2 residential-IP fallback: runs in the user's browser (residential/mobile IP)
  * when the cloud server IP is rate-limited by YouTube anti-bot checks.
  */
-async function probeClientDirectStreams(videoId: string): Promise<{ audioUrl: string | null; videoUrl: string | null } | null> {
-  const pipedHosts = [
-    'https://pipedapi.kavin.rocks',
-    'https://pipedapi.adminforge.de',
-    'https://api.piped.private.coffee',
-  ];
+async function probeClientDirectStreams(
+  videoId: string
+): Promise<{ audioUrl: string | null; videoUrl: string | null } | null> {
+  const apple = isAppleTouchBrowser();
+  const invHosts = await getInvidiousHosts().catch(() => INVIDIOUS_FALLBACK_HOSTS);
 
-  const probes = pipedHosts.map(async (host) => {
+  const pipedProbes = PIPED_HOSTS.map(async (host) => {
     const ctrl = new AbortController();
-    const timer = window.setTimeout(() => ctrl.abort(), 2400);
+    const timer = window.setTimeout(() => ctrl.abort(), 2800);
     try {
       const r = await fetch(`${host}/streams/${videoId}`, { signal: ctrl.signal });
       if (!r.ok) throw new Error('status');
@@ -99,21 +168,51 @@ async function probeClientDirectStreams(videoId: string): Promise<{ audioUrl: st
         audioStreams?: Array<{ url?: string; mimeType?: string; bitrate?: number }>;
         videoStreams?: Array<{ url?: string; mimeType?: string; videoOnly?: boolean; quality?: string }>;
       };
-      const bestAudio = (data.audioStreams || [])
-        .filter((s) => s.url)
-        .sort((a, b) => {
-          const aMp4 = a.mimeType?.includes('mp4') || a.mimeType?.includes('m4a') ? 1 : 0;
-          const bMp4 = b.mimeType?.includes('mp4') || b.mimeType?.includes('m4a') ? 1 : 0;
-          if (aMp4 !== bMp4) return bMp4 - aMp4;
-          return (b.bitrate || 0) - (a.bitrate || 0);
-        })[0];
+      const mp4Audio = (data.audioStreams || [])
+        .filter((s) => s.url && (s.mimeType?.includes('mp4') || s.mimeType?.includes('m4a')))
+        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+      const anyAudio = apple
+        ? null
+        : (data.audioStreams || [])
+            .filter((s) => s.url)
+            .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
       const bestVideo = (data.videoStreams || [])
         .filter((s) => s.url && !s.videoOnly && s.mimeType?.includes('mp4'))
         .sort((a, b) => parseInt(b.quality || '0', 10) - parseInt(a.quality || '0', 10))[0];
 
-      if (!bestAudio?.url && !bestVideo?.url) throw new Error('empty');
+      const chosenAudioUrl = mp4Audio?.url || bestVideo?.url || anyAudio?.url || null;
+      if (!chosenAudioUrl && !bestVideo?.url) throw new Error('empty');
       return {
-        audioUrl: bestAudio?.url || bestVideo?.url || null,
+        audioUrl: chosenAudioUrl,
+        videoUrl: bestVideo?.url || null,
+      };
+    } finally {
+      window.clearTimeout(timer);
+    }
+  });
+
+  const invidiousProbes = invHosts.map(async (host) => {
+    const ctrl = new AbortController();
+    const timer = window.setTimeout(() => ctrl.abort(), 3000);
+    try {
+      const r = await fetch(`${host}/api/v1/videos/${videoId}`, { signal: ctrl.signal });
+      if (!r.ok) throw new Error('status');
+      const data = (await r.json()) as {
+        adaptiveFormats?: Array<{ url?: string; type?: string; bitrate?: string | number }>;
+        formatStreams?: Array<{ url?: string; type?: string; qualityLabel?: string }>;
+      };
+      const mp4Audio = (data.adaptiveFormats || [])
+        .filter((f) => f.url && f.type?.includes('audio/mp4'))
+        .sort((a, b) => Number(b.bitrate || 0) - Number(a.bitrate || 0))[0];
+      const bestVideo = (data.formatStreams || [])
+        .filter((f) => f.url && f.type?.includes('video/mp4'))
+        .sort((a, b) => parseInt(b.qualityLabel || '0', 10) - parseInt(a.qualityLabel || '0', 10))[0];
+
+      const chosenAudioUrl = mp4Audio?.url || bestVideo?.url || null;
+      if (!chosenAudioUrl && !bestVideo?.url) throw new Error('empty');
+      return {
+        audioUrl: chosenAudioUrl,
         videoUrl: bestVideo?.url || null,
       };
     } finally {
@@ -122,7 +221,7 @@ async function probeClientDirectStreams(videoId: string): Promise<{ audioUrl: st
   });
 
   try {
-    return await Promise.any(probes);
+    return await Promise.any([...pipedProbes, ...invidiousProbes]);
   } catch {
     return null;
   }
@@ -150,6 +249,20 @@ export function useMediaEngine({
   const skippedUuidsRef = useRef<Set<string>>(new Set());
   const backgroundHandoffActiveRef = useRef<boolean>(false);
 
+  // Background playback intent & recovery refs
+  const userWantsPlayingRef = useRef<boolean>(false);
+  const lastKnownTimeRef = useRef<number>(0);
+  const recoveryAttemptsRef = useRef<number>(0);
+  const stallWatchdogRef = useRef<number | null>(null);
+  const isRecoveringRef = useRef<boolean>(false);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const audioUnlockedRef = useRef<boolean>(false);
+  const isUnlockingAudioRef = useRef<boolean>(false);
+  const isRetryingNativeRef = useRef<boolean>(false);
+  const lastPositionSyncAtRef = useRef<number>(0);
+  const audioMetaCleanupRef = useRef<(() => void) | null>(null);
+  const videoMetaCleanupRef = useRef<(() => void) | null>(null);
+
   const mediaUrlsRef = useRef<ResolvedMediaUrls>({
     audioUrl: null,
     videoUrl: null,
@@ -162,6 +275,7 @@ export function useMediaEngine({
   const [playMode, setPlayMode] = useState<PlayMode>('audio');
   const [activeEngine, setActiveEngine] = useState<ActiveEngine>('native-audio');
   const [streamSourceLabel, setStreamSourceLabel] = useState<string | null>(null);
+  const [isRetryingNative, setIsRetryingNative] = useState<boolean>(false);
   const [isPiPSupported, setIsPiPSupported] = useState<boolean>(false);
 
   const [isPlaying, setIsPlaying] = useState(false);
@@ -180,6 +294,11 @@ export function useMediaEngine({
   const [sleepEndOfTrack, setSleepEndOfTrack] = useState(false);
   const [sleepRemainingSec, setSleepRemainingSec] = useState<number>(0);
 
+  const currentTrack: TrackItem | null =
+    currentIndex >= 0 && currentIndex < queue.length ? queue[currentIndex] : null;
+  const currentTrackRef = useRef<TrackItem | null>(currentTrack);
+  currentTrackRef.current = currentTrack;
+
   const stateRef = useRef({
     repeatMode,
     sleepEndOfTrack,
@@ -194,6 +313,7 @@ export function useMediaEngine({
     activeEngine,
     playMode,
     isPlaying,
+    duration,
   });
   stateRef.current = {
     repeatMode,
@@ -209,18 +329,94 @@ export function useMediaEngine({
     activeEngine,
     playMode,
     isPlaying,
+    duration,
   };
 
-  const currentTrack: TrackItem | null =
-    currentIndex >= 0 && currentIndex < queue.length ? queue[currentIndex] : null;
+  // Create or resume AudioContext on user gesture and foreground return
+  const ensureAudioContext = useCallback(() => {
+    if (typeof window === 'undefined') return;
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return;
+    try {
+      if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+        audioCtxRef.current = new AudioCtx();
+      }
+      const ctx = audioCtxRef.current;
+      if (ctx.state === 'suspended' || (ctx.state as string) === 'interrupted') {
+        void ctx.resume().catch(() => {});
+      }
+    } catch {
+      // Ignore AudioContext restriction errors
+    }
+  }, []);
 
-  // Initialize hidden native <audio> element once for guaranteed background lock-screen playback
+  // Synchronously prime the DOM-mounted <audio> element inside a user tap gesture for iOS Safari
+  const unlockAudioSync = useCallback(() => {
+    ensureAudioContext();
+    const audio = audioRef.current;
+    if (!audio || audioUnlockedRef.current) return;
+    const currentSrc = audio.getAttribute('src') || '';
+    const hasRealStream = Boolean(currentSrc && !currentSrc.startsWith('data:audio/wav'));
+    if (hasRealStream && !audio.paused) {
+      audioUnlockedRef.current = true;
+      return;
+    }
+    if (!hasRealStream) {
+      try {
+        isUnlockingAudioRef.current = true;
+        audio.src = SILENT_WAV_DATA_URI;
+        const p = audio.play();
+        if (p && typeof p.then === 'function') {
+          p.then(() => {
+            audioUnlockedRef.current = true;
+            isUnlockingAudioRef.current = false;
+          }).catch(() => {
+            isUnlockingAudioRef.current = false;
+          });
+        } else {
+          audioUnlockedRef.current = true;
+          isUnlockingAudioRef.current = false;
+        }
+      } catch {
+        isUnlockingAudioRef.current = false;
+      }
+    }
+  }, [ensureAudioContext]);
+
+  const clearStallWatchdog = useCallback(() => {
+    if (stallWatchdogRef.current !== null) {
+      window.clearTimeout(stallWatchdogRef.current);
+      stallWatchdogRef.current = null;
+    }
+  }, []);
+
+  const syncMediaSessionPosition = useCallback((positionSeconds: number, durOverride?: number) => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    if (!('setPositionState' in navigator.mediaSession)) return;
+    const dur = durOverride && durOverride > 0 ? durOverride : stateRef.current.duration;
+    const rate = stateRef.current.playbackRate;
+    if (!dur || !Number.isFinite(dur) || dur <= 0 || !Number.isFinite(rate) || rate <= 0) return;
+    try {
+      navigator.mediaSession.setPositionState({
+        duration: dur,
+        playbackRate: rate,
+        position: Math.min(Math.max(0, Number.isFinite(positionSeconds) ? positionSeconds : 0), dur),
+      });
+    } catch {
+      // Ignore transient invalid state
+    }
+  }, []);
+
+  // Configure DOM-mounted <audio> element once for guaranteed background lock-screen playback
   useEffect(() => {
-    const audio = new Audio();
-    audio.preload = 'auto';
-    audio.setAttribute('playsinline', 'true');
-    audio.setAttribute('webkit-playsinline', 'true');
-    audioRef.current = audio;
+    const audio = audioRef.current;
+    if (audio) {
+      audio.preload = 'auto';
+      audio.setAttribute('playsinline', 'true');
+      audio.setAttribute('webkit-playsinline', 'true');
+    }
 
     setIsPiPSupported(
       typeof document !== 'undefined' &&
@@ -230,14 +426,24 @@ export function useMediaEngine({
     );
 
     return () => {
-      audio.pause();
-      audio.src = '';
-      audioRef.current = null;
+      clearStallWatchdog();
+      audioMetaCleanupRef.current?.();
+      videoMetaCleanupRef.current?.();
+      if (audio) {
+        audio.pause();
+        audio.removeAttribute('src');
+        audio.load();
+      }
+      if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+        void audioCtxRef.current.close().catch(() => {});
+      }
+      audioCtxRef.current = null;
     };
-  }, []);
+  }, [clearStallWatchdog]);
 
   const stopAllEngines = useCallback(() => {
-    if (audioRef.current) {
+    clearStallWatchdog();
+    if (audioRef.current && !isUnlockingAudioRef.current) {
       audioRef.current.pause();
     }
     if (videoRef.current) {
@@ -248,9 +454,84 @@ export function useMediaEngine({
     } catch {
       // Ignore
     }
+  }, [clearStallWatchdog]);
+
+  const resolveTrackStreams = useCallback(async (videoId: string): Promise<ResolvedMediaUrls> => {
+    let audioUrl: string | null = null;
+    let videoUrl: string | null = null;
+    let sourceLabel: string | null = null;
+    let botCheckBlocked = false;
+
+    try {
+      const resp = await fetch(`/api/media-meta/${videoId}`);
+      if (resp.ok) {
+        const meta = (await resp.json()) as {
+          audioAvailable?: boolean;
+          videoAvailable?: boolean;
+          audioUrl?: string | null;
+          videoUrl?: string | null;
+          videoQuality?: string | null;
+          botCheckBlocked?: boolean;
+        };
+        audioUrl = meta.audioAvailable ? meta.audioUrl || null : null;
+        videoUrl = meta.videoAvailable ? meta.videoUrl || null : null;
+        botCheckBlocked = Boolean(meta.botCheckBlocked);
+        if (audioUrl || videoUrl) {
+          sourceLabel = meta.videoQuality
+            ? `Luồng gốc không quảng cáo (${meta.videoQuality})`
+            : 'Luồng gốc không quảng cáo';
+        }
+      }
+    } catch {
+      // Proceed to Tier 2
+    }
+
+    if (!audioUrl && !videoUrl) {
+      const clientResolved = await probeClientDirectStreams(videoId);
+      if (clientResolved) {
+        audioUrl = clientResolved.audioUrl;
+        videoUrl = clientResolved.videoUrl;
+        sourceLabel = 'Luồng trực tiếp không quảng cáo';
+      }
+    }
+
+    return { audioUrl, videoUrl, sourceLabel, botCheckBlocked };
   }, []);
 
+  const recoverPlaybackRef = useRef<(reason: string) => Promise<void>>(async () => {});
+
+  const scheduleStallWatchdog = useCallback(() => {
+    clearStallWatchdog();
+    if (!userWantsPlayingRef.current || !currentTrackRef.current) return;
+    if (stateRef.current.activeEngine === 'yt-privacy') return;
+
+    stallWatchdogRef.current = window.setTimeout(() => {
+      stallWatchdogRef.current = null;
+      if (!userWantsPlayingRef.current || !currentTrackRef.current) return;
+      const eng = stateRef.current.activeEngine;
+      const el =
+        eng === 'native-audio'
+          ? audioRef.current
+          : eng === 'native-video'
+          ? videoRef.current
+          : null;
+      if (!el) return;
+
+      const stillStuck =
+        el.paused ||
+        el.readyState < 3 ||
+        el.networkState === HTMLMediaElement.NETWORK_NO_SOURCE;
+      if (stillStuck) {
+        void recoverPlaybackRef.current('watchdog');
+      } else {
+        setIsLoading(false);
+      }
+    }, STALL_WATCHDOG_MS);
+  }, [clearStallWatchdog]);
+
   const playNext = useCallback(() => {
+    unlockAudioSync();
+    recoveryAttemptsRef.current = 0;
     setQueue((q) => {
       if (q.length === 0) return q;
       const { isShuffled: shuf, repeatMode: rep } = stateRef.current;
@@ -260,58 +541,82 @@ export function useMediaEngine({
           while (nextIdx === idx) {
             nextIdx = Math.floor(Math.random() * q.length);
           }
+          userWantsPlayingRef.current = true;
           return nextIdx;
         }
-        if (idx < q.length - 1) return idx + 1;
-        if (rep === 'all') return 0;
+        if (idx < q.length - 1) {
+          userWantsPlayingRef.current = true;
+          return idx + 1;
+        }
+        if (rep === 'all') {
+          userWantsPlayingRef.current = true;
+          return 0;
+        }
+        userWantsPlayingRef.current = false;
         setIsPlaying(false);
+        setIsLoading(false);
         return idx;
       });
       return q;
     });
-  }, []);
+  }, [unlockAudioSync]);
 
   const playPrev = useCallback(() => {
+    unlockAudioSync();
+    recoveryAttemptsRef.current = 0;
     const eng = stateRef.current.activeEngine;
     const nowTime =
       eng === 'native-audio'
-        ? audioRef.current?.currentTime || 0
+        ? audioRef.current?.currentTime || lastKnownTimeRef.current || 0
         : eng === 'native-video'
-        ? videoRef.current?.currentTime || 0
-        : ytPlayerRef.current?.getCurrentTime?.() || 0;
+        ? videoRef.current?.currentTime || lastKnownTimeRef.current || 0
+        : ytPlayerRef.current?.getCurrentTime?.() || lastKnownTimeRef.current || 0;
 
     if (nowTime > 4) {
       if (eng === 'native-audio' && audioRef.current) audioRef.current.currentTime = 0;
       else if (eng === 'native-video' && videoRef.current) videoRef.current.currentTime = 0;
       else ytPlayerRef.current?.seekTo(0, true);
+      lastKnownTimeRef.current = 0;
       setCurrentTime(0);
+      syncMediaSessionPosition(0);
       return;
     }
 
     if (queue.length === 0) return;
     if (currentIndex > 0) {
+      userWantsPlayingRef.current = true;
       setCurrentIndex((i) => i - 1);
     } else if (repeatMode === 'all') {
+      userWantsPlayingRef.current = true;
       setCurrentIndex(queue.length - 1);
     }
-  }, [currentIndex, queue.length, repeatMode]);
+  }, [currentIndex, queue.length, repeatMode, syncMediaSessionPosition, unlockAudioSync]);
 
   const handleTrackEnded = useCallback(() => {
+    clearStallWatchdog();
     const { sleepEndOfTrack: stopAtEnd, repeatMode: rep, activeEngine: eng } = stateRef.current;
     if (stopAtEnd) {
+      userWantsPlayingRef.current = false;
       setSleepEndOfTrack(false);
       setIsPlaying(false);
+      setIsLoading(false);
       onNotice('Hẹn giờ tắt: đã dừng phát khi kết thúc bài.');
       return;
     }
     if (rep === 'one') {
       skippedUuidsRef.current.clear();
+      userWantsPlayingRef.current = true;
+      lastKnownTimeRef.current = 0;
       if (eng === 'native-audio' && audioRef.current) {
         audioRef.current.currentTime = 0;
-        audioRef.current.play().catch(() => {});
+        audioRef.current.play().catch(() => {
+          void recoverPlaybackRef.current('repeat-one');
+        });
       } else if (eng === 'native-video' && videoRef.current) {
         videoRef.current.currentTime = 0;
-        videoRef.current.play().catch(() => {});
+        videoRef.current.play().catch(() => {
+          void recoverPlaybackRef.current('repeat-one');
+        });
       } else if (ytPlayerRef.current) {
         ytPlayerRef.current.seekTo(0, true);
         ytPlayerRef.current.playVideo();
@@ -319,15 +624,20 @@ export function useMediaEngine({
       return;
     }
     playNext();
-  }, [onNotice, playNext]);
+  }, [clearStallWatchdog, onNotice, playNext]);
 
   const handleTrackEndedRef = useRef(handleTrackEnded);
   handleTrackEndedRef.current = handleTrackEnded;
 
   const startNativeAudio = useCallback(
-    (url: string, startAt = 0, shouldPlay = true) => {
+    (url: string, startAt = 0, shouldPlay = true, forceReload = false) => {
       const audio = audioRef.current;
       if (!audio) return;
+
+      audioMetaCleanupRef.current?.();
+      audioMetaCleanupRef.current = null;
+      isUnlockingAudioRef.current = false;
+
       videoRef.current?.pause();
       try {
         ytPlayerRef.current?.pauseVideo?.();
@@ -335,52 +645,101 @@ export function useMediaEngine({
         // Ignore
       }
       setActiveEngine('native-audio');
-      const needsLoad = audio.getAttribute('data-stream-url') !== url;
+
+      const effectiveUrl = forceReload ? appendCacheBusterIfLocal(url) || url : url;
+      const currentAttrUrl = audio.getAttribute('data-stream-url');
+      const needsLoad =
+        forceReload ||
+        currentAttrUrl !== effectiveUrl ||
+        !audio.src ||
+        audio.src.startsWith('data:audio/wav') ||
+        Boolean(audio.error);
+
+      audio.preload = 'auto';
       if (needsLoad) {
-        audio.setAttribute('data-stream-url', url);
-        audio.src = url;
+        audio.setAttribute('data-stream-url', effectiveUrl);
+        audio.src = effectiveUrl;
         audio.load();
       }
       audio.playbackRate = stateRef.current.playbackRate;
       audio.volume = stateRef.current.isMuted ? 0 : stateRef.current.volume;
 
-      const finishStart = () => {
-        if (startAt > 0.5 && Number.isFinite(audio.duration) && startAt < audio.duration) {
-          audio.currentTime = startAt;
-        }
-        if (shouldPlay) {
-          audio
-            .play()
-            .then(() => {
-              setIsPlaying(true);
-              setIsLoading(false);
-            })
-            .catch(() => {
-              setIsLoading(false);
-              setIsPlaying(false);
-            });
-        } else {
-          setIsLoading(false);
+      const applySeek = () => {
+        if (startAt > 0.5) {
+          const maxSafe =
+            Number.isFinite(audio.duration) && audio.duration > 1 ? audio.duration - 0.5 : startAt;
+          const clampedStart = Math.min(startAt, maxSafe);
+          try {
+            audio.currentTime = clampedStart;
+            lastKnownTimeRef.current = clampedStart;
+          } catch {
+            // Seek will apply when buffered
+          }
         }
       };
 
-      if (!needsLoad && audio.readyState >= 1) {
-        finishStart();
-      } else {
+      if (audio.readyState >= 1) {
+        applySeek();
+      } else if (startAt > 0.5 || !shouldPlay) {
         const onMeta = () => {
-          audio.removeEventListener('loadedmetadata', onMeta);
-          finishStart();
+          audioMetaCleanupRef.current?.();
+          audioMetaCleanupRef.current = null;
+          applySeek();
+          if (shouldPlay && audio.paused && userWantsPlayingRef.current) {
+            audio.play().catch(() => {});
+          } else if (!shouldPlay) {
+            clearStallWatchdog();
+            setIsLoading(false);
+          }
         };
         audio.addEventListener('loadedmetadata', onMeta);
+        audioMetaCleanupRef.current = () => {
+          audio.removeEventListener('loadedmetadata', onMeta);
+        };
+      }
+
+      if (shouldPlay) {
+        userWantsPlayingRef.current = true;
+        setIsLoading(audio.readyState < 3);
+        scheduleStallWatchdog();
+        if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+          navigator.mediaSession.playbackState = 'playing';
+        }
+        const playPromise = audio.play();
+        if (playPromise && typeof playPromise.then === 'function') {
+          playPromise
+            .then(() => {
+              audioUnlockedRef.current = true;
+              clearStallWatchdog();
+              setIsPlaying(true);
+              setIsLoading(false);
+            })
+            .catch((err: DOMException | Error) => {
+              if (err?.name === 'NotAllowedError') {
+                clearStallWatchdog();
+                setIsLoading(false);
+                setIsPlaying(false);
+              } else if (err?.name !== 'AbortError') {
+                void recoverPlaybackRef.current('audio-play-rejected');
+              }
+            });
+        }
+      } else {
+        clearStallWatchdog();
+        setIsLoading(false);
       }
     },
-    []
+    [clearStallWatchdog, scheduleStallWatchdog]
   );
 
   const startNativeVideo = useCallback(
-    (url: string, startAt = 0, shouldPlay = true) => {
+    (url: string, startAt = 0, shouldPlay = true, forceReload = false) => {
       const video = videoRef.current;
       if (!video) return;
+
+      videoMetaCleanupRef.current?.();
+      videoMetaCleanupRef.current = null;
+
       audioRef.current?.pause();
       try {
         ytPlayerRef.current?.pauseVideo?.();
@@ -388,10 +747,26 @@ export function useMediaEngine({
         // Ignore
       }
       setActiveEngine('native-video');
-      const needsLoad = video.getAttribute('data-stream-url') !== url;
+
+      // Pre-warm audio stream metadata in background so screen-off handoff or lock-screen play is synchronous
+      const bgAudio = audioRef.current;
+      const bgAudioUrl = mediaUrlsRef.current.audioUrl;
+      if (bgAudio && bgAudioUrl && bgAudio.getAttribute('data-stream-url') !== bgAudioUrl) {
+        bgAudio.preload = 'metadata';
+        bgAudio.setAttribute('data-stream-url', bgAudioUrl);
+        bgAudio.src = bgAudioUrl;
+      }
+
+      const effectiveUrl = forceReload ? appendCacheBusterIfLocal(url) || url : url;
+      const needsLoad =
+        forceReload ||
+        video.getAttribute('data-stream-url') !== effectiveUrl ||
+        !video.src ||
+        Boolean(video.error);
+
       if (needsLoad) {
-        video.setAttribute('data-stream-url', url);
-        video.src = url;
+        video.setAttribute('data-stream-url', effectiveUrl);
+        video.src = effectiveUrl;
         video.load();
       }
       video.playbackRate = stateRef.current.playbackRate;
@@ -399,21 +774,38 @@ export function useMediaEngine({
       video.muted = stateRef.current.isMuted;
 
       const finishStart = () => {
-        if (startAt > 0.5 && Number.isFinite(video.duration) && startAt < video.duration) {
-          video.currentTime = startAt;
+        if (startAt > 0.5) {
+          const maxSafe =
+            Number.isFinite(video.duration) && video.duration > 1 ? video.duration - 0.5 : startAt;
+          const clampedStart = Math.min(startAt, maxSafe);
+          try {
+            video.currentTime = clampedStart;
+            lastKnownTimeRef.current = clampedStart;
+          } catch {
+            // Seek will be applied once buffered
+          }
         }
         if (shouldPlay) {
+          userWantsPlayingRef.current = true;
+          scheduleStallWatchdog();
           video
             .play()
             .then(() => {
+              clearStallWatchdog();
               setIsPlaying(true);
               setIsLoading(false);
             })
-            .catch(() => {
-              setIsLoading(false);
-              setIsPlaying(false);
+            .catch((err: DOMException | Error) => {
+              if (err?.name === 'NotAllowedError') {
+                clearStallWatchdog();
+                setIsLoading(false);
+                setIsPlaying(false);
+              } else {
+                void recoverPlaybackRef.current('video-play-rejected');
+              }
             });
         } else {
+          clearStallWatchdog();
           setIsLoading(false);
         }
       };
@@ -421,20 +813,29 @@ export function useMediaEngine({
       if (!needsLoad && video.readyState >= 1) {
         finishStart();
       } else {
+        if (shouldPlay) {
+          setIsLoading(true);
+          scheduleStallWatchdog();
+        }
         const onMeta = () => {
-          video.removeEventListener('loadedmetadata', onMeta);
+          videoMetaCleanupRef.current?.();
+          videoMetaCleanupRef.current = null;
           finishStart();
         };
         video.addEventListener('loadedmetadata', onMeta);
+        videoMetaCleanupRef.current = () => {
+          video.removeEventListener('loadedmetadata', onMeta);
+        };
       }
     },
-    []
+    [clearStallWatchdog, scheduleStallWatchdog]
   );
 
   // Persistent singleton YT.Player fallback when both Tier-1 server and Tier-2 browser streams are blocked
   const ensureYtPlayer = useCallback(
     async (videoId: string, startSeconds = 0) => {
       pendingYtTrackRef.current = videoId;
+      clearStallWatchdog();
       audioRef.current?.pause();
       videoRef.current?.pause();
       setActiveEngine('yt-privacy');
@@ -487,7 +888,10 @@ export function useMediaEngine({
               target.playVideo();
             }
             const d = target.getDuration?.();
-            if (d && d > 0) setDuration(d);
+            if (d && d > 0) {
+              setDuration(d);
+              syncMediaSessionPosition(target.getCurrentTime?.() || 0, d);
+            }
             setIsLoading(false);
           },
           onStateChange: (e) => {
@@ -497,9 +901,22 @@ export function useMediaEngine({
               setIsPlaying(true);
               setIsLoading(false);
               const d = e.target.getDuration?.();
-              if (d && d > 0) setDuration(d);
+              const now = e.target.getCurrentTime?.() || 0;
+              if (d && d > 0) {
+                setDuration(d);
+                syncMediaSessionPosition(now, d);
+              }
+              if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+                navigator.mediaSession.playbackState = 'playing';
+              }
             } else if (st === 2) {
               setIsPlaying(false);
+              const d = e.target.getDuration?.();
+              const now = e.target.getCurrentTime?.() || 0;
+              if (d && d > 0) syncMediaSessionPosition(now, d);
+              if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+                navigator.mediaSession.playbackState = 'paused';
+              }
             } else if (st === 3) {
               setIsLoading(true);
             } else if (st === 0) {
@@ -509,13 +926,104 @@ export function useMediaEngine({
           onError: () => {
             setIsLoading(false);
             setIsPlaying(false);
+            userWantsPlayingRef.current = false;
             onNotice('Video này bị chủ sở hữu hạn chế nhúng — vui lòng chọn bài khác.');
           },
         },
       });
     },
-    [onNotice]
+    [clearStallWatchdog, onNotice]
   );
+
+  // Automatic stream recovery (max 3 attempts) — reloads stream, seeks to saved timestamp, resumes
+  const recoverPlayback = useCallback(
+    async (_reason: string) => {
+      if (isRecoveringRef.current) return;
+      const track = currentTrackRef.current;
+      if (!track || !userWantsPlayingRef.current) {
+        clearStallWatchdog();
+        setIsLoading(false);
+        return;
+      }
+
+      if (recoveryAttemptsRef.current >= MAX_RECOVERY_ATTEMPTS) {
+        userWantsPlayingRef.current = false;
+        stopAllEngines();
+        setIsLoading(false);
+        setIsPlaying(false);
+        if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+          navigator.mediaSession.playbackState = 'paused';
+        }
+        onNotice('Không thể tiếp tục phát sau 3 lần thử lại. Vui lòng bấm Phát để thử lại.');
+        return;
+      }
+
+      recoveryAttemptsRef.current += 1;
+      const attempt = recoveryAttemptsRef.current;
+      isRecoveringRef.current = true;
+      setIsLoading(true);
+
+      const resumeAt = lastKnownTimeRef.current;
+      const trackIdAtStart = track.id;
+
+      try {
+        let urls = mediaUrlsRef.current;
+        if (attempt >= 2 || (!urls.audioUrl && !urls.videoUrl)) {
+          const refreshed = await resolveTrackStreams(trackIdAtStart);
+          if (currentTrackRef.current?.id !== trackIdAtStart || !userWantsPlayingRef.current) {
+            return;
+          }
+          if (refreshed.audioUrl || refreshed.videoUrl) {
+            urls = refreshed;
+            mediaUrlsRef.current = refreshed;
+            setStreamSourceLabel(refreshed.sourceLabel);
+          }
+        }
+
+        if (currentTrackRef.current?.id !== trackIdAtStart || !userWantsPlayingRef.current) {
+          return;
+        }
+
+        const preferAudio =
+          document.hidden ||
+          stateRef.current.playMode === 'audio' ||
+          stateRef.current.activeEngine === 'native-audio';
+
+        if (preferAudio && (urls.audioUrl || urls.videoUrl)) {
+          if (stateRef.current.playMode === 'video' && document.hidden) {
+            backgroundHandoffActiveRef.current = true;
+          }
+          startNativeAudio((urls.audioUrl || urls.videoUrl)!, resumeAt, true, true);
+        } else if (urls.videoUrl && stateRef.current.playMode === 'video') {
+          startNativeVideo(urls.videoUrl, resumeAt, true, true);
+        } else if (urls.audioUrl) {
+          startNativeAudio(urls.audioUrl, resumeAt, true, true);
+        } else {
+          // Stream unavailable after resolving — allow retry countdown to complete cleanly
+          if (attempt >= MAX_RECOVERY_ATTEMPTS) {
+            userWantsPlayingRef.current = false;
+            setIsLoading(false);
+            setIsPlaying(false);
+            onNotice('Nguồn phát tạm thời gián đoạn. Vui lòng bấm Phát để thử lại.');
+          } else {
+            scheduleStallWatchdog();
+          }
+        }
+      } finally {
+        isRecoveringRef.current = false;
+      }
+    },
+    [
+      clearStallWatchdog,
+      onNotice,
+      resolveTrackStreams,
+      scheduleStallWatchdog,
+      startNativeAudio,
+      startNativeVideo,
+      stopAllEngines,
+    ]
+  );
+  recoverPlaybackRef.current = recoverPlayback;
 
   // SponsorBlock live auto-skip watcher shared across ALL 3 engines
   const checkSponsorSkip = useCallback(
@@ -529,8 +1037,10 @@ export function useMediaEngine({
         if (now >= seg.start && now < seg.end - 0.35) {
           skippedUuidsRef.current.add(seg.uuid);
           const target = Math.min(seg.end + 0.08, dur || seg.end);
+          lastKnownTimeRef.current = target;
           doSeek(target);
           setCurrentTime(target);
+          syncMediaSessionPosition(target, dur);
           const saved = Math.max(1, Math.round(seg.end - now));
           const label = SPONSOR_CATEGORY_LABELS[seg.category]?.label || 'Quảng cáo';
           onSponsorSkip(saved, label);
@@ -538,7 +1048,7 @@ export function useMediaEngine({
         }
       }
     },
-    [onSponsorSkip]
+    [onSponsorSkip, syncMediaSessionPosition]
   );
 
   // Load track streams (Tier 1 Server Proxy -> Tier 2 Client Residential IP -> Tier 3 YT Privacy)
@@ -548,6 +1058,9 @@ export function useMediaEngine({
     let cancelled = false;
     skippedUuidsRef.current.clear();
     backgroundHandoffActiveRef.current = false;
+    recoveryAttemptsRef.current = 0;
+    lastKnownTimeRef.current = 0;
+    userWantsPlayingRef.current = true;
     mediaUrlsRef.current = {
       audioUrl: null,
       videoUrl: null,
@@ -577,55 +1090,21 @@ export function useMediaEngine({
       });
 
     (async () => {
-      // Tier 1: Server-side verified YouTube direct HTTP 206 Audio & Video streams
-      let audioUrl: string | null = null;
-      let videoUrl: string | null = null;
-      let sourceLabel: string | null = null;
-      let botCheckBlocked = false;
-
-      try {
-        const resp = await fetch(`/api/media-meta/${currentTrack.id}`);
-        if (resp.ok) {
-          const meta = (await resp.json()) as {
-            audioAvailable?: boolean;
-            videoAvailable?: boolean;
-            audioUrl?: string | null;
-            videoUrl?: string | null;
-            videoQuality?: string | null;
-            botCheckBlocked?: boolean;
-          };
-          audioUrl = meta.audioAvailable ? meta.audioUrl || null : null;
-          videoUrl = meta.videoAvailable ? meta.videoUrl || null : null;
-          botCheckBlocked = Boolean(meta.botCheckBlocked);
-          if (audioUrl || videoUrl) {
-            sourceLabel = meta.videoQuality
-              ? `Luồng gốc không quảng cáo (${meta.videoQuality})`
-              : 'Luồng gốc không quảng cáo';
-          }
-        }
-      } catch {
-        // Proceed to Tier 2
-      }
-
+      const resolved = await resolveTrackStreams(currentTrack.id);
       if (cancelled) return;
 
-      // Tier 2: Browser residential-IP direct stream probe when Cloud IP hit YouTube anti-bot wall
-      if (!audioUrl && !videoUrl) {
-        const clientResolved = await probeClientDirectStreams(currentTrack.id);
-        if (cancelled) return;
-        if (clientResolved) {
-          audioUrl = clientResolved.audioUrl;
-          videoUrl = clientResolved.videoUrl;
-          sourceLabel = 'Luồng trực tiếp không quảng cáo';
-        }
-      }
+      mediaUrlsRef.current = resolved;
+      setStreamSourceLabel(resolved.sourceLabel);
 
-      mediaUrlsRef.current = { audioUrl, videoUrl, sourceLabel, botCheckBlocked };
-      setStreamSourceLabel(sourceLabel);
-
+      const { audioUrl, videoUrl } = resolved;
       const desiredMode = stateRef.current.playMode;
-      if (desiredMode === 'video' && videoUrl) {
+      const shouldStartVideo = desiredMode === 'video' && videoUrl && !document.hidden;
+
+      if (shouldStartVideo && videoUrl) {
         startNativeVideo(videoUrl, 0, true);
+      } else if (desiredMode === 'video' && document.hidden && (audioUrl || videoUrl)) {
+        backgroundHandoffActiveRef.current = true;
+        startNativeAudio((audioUrl || videoUrl)!, 0, true);
       } else if (desiredMode === 'audio' && audioUrl) {
         startNativeAudio(audioUrl, 0, true);
       } else if (audioUrl) {
@@ -634,7 +1113,10 @@ export function useMediaEngine({
         startNativeVideo(videoUrl, 0, true);
       } else {
         // Tier 3: Honest YouTube Privacy fallback (still runs live SponsorBlock auto-skip)
-        setStreamSourceLabel('Nguồn dự phòng YouTube (IP đám mây bị giới hạn trích xuất gốc)');
+        setStreamSourceLabel('Đang dùng iframe YouTube dự phòng (không chạy nền khi khóa máy)');
+        onNotice(
+          'Bài này đang dùng trình phát dự phòng (iframe): Safari iPhone sẽ dừng khi tắt màn hình. Bấm Phát để thử lấy lại luồng gốc.'
+        );
         void ensureYtPlayer(currentTrack.id, 0);
       }
     })();
@@ -645,12 +1127,14 @@ export function useMediaEngine({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentTrack?.id]);
 
-  // REAL LOCK-SCREEN / SCREEN-OFF CONTINUITY FOR VIDEO MODE:
-  // On mobile browsers (iOS Safari / Android Chrome), locking the screen pauses <video>.
-  // When hidden while playing native-video (and not in PiP), seamlessly hand off to native <audio>
-  // at the exact timestamp so audio NEVER stops when the screen turns off!
+  // REAL LOCK-SCREEN / SCREEN-OFF CONTINUITY FOR BOTH AUDIO & VIDEO MODES:
+  // 1. On screen off (document.hidden): if in Video mode (and not PiP) and userWantsPlaying,
+  //    immediately hand off to native <audio> synchronously at exact timestamp (even if OS paused <video> right before).
+  // 2. On screen on / tab return (visibilitychange visible, pageshow, focus):
+  //    resume AudioContext, restore Video playback synced to audio timestamp if handed off,
+  //    or resume paused/stalled playback if userWantsPlaying is true.
   useEffect(() => {
-    const handleVisibilityChange = () => {
+    const handleBackgroundTransition = () => {
       const video = videoRef.current;
       const audio = audioRef.current;
       const { audioUrl, videoUrl } = mediaUrlsRef.current;
@@ -658,89 +1142,313 @@ export function useMediaEngine({
 
       if (document.hidden) {
         const isInPiP = document.pictureInPictureElement === video;
+        const webkitVideo = video as unknown as { webkitPresentationMode?: string };
+        const isVideoFullscreen =
+          document.fullscreenElement === video || webkitVideo.webkitPresentationMode === 'fullscreen';
         if (
           stateRef.current.activeEngine === 'native-video' &&
-          !video.paused &&
+          userWantsPlayingRef.current &&
           !isInPiP &&
+          !isVideoFullscreen &&
           (audioUrl || videoUrl)
         ) {
-          const resumeAt = video.currentTime;
+          const resumeAt = Math.max(video.currentTime || 0, lastKnownTimeRef.current || 0);
+          lastKnownTimeRef.current = resumeAt;
           backgroundHandoffActiveRef.current = true;
           video.pause();
-          startNativeAudio(audioUrl || videoUrl!, resumeAt, true);
+
+          const targetAudioUrl = (audioUrl || videoUrl)!;
+          if (audio.getAttribute('data-stream-url') === targetAudioUrl && audio.readyState >= 1) {
+            // Synchronous handoff inside visibilitychange so iOS Safari / Android Chrome keep audio alive
+            setActiveEngine('native-audio');
+            audio.playbackRate = stateRef.current.playbackRate;
+            audio.volume = stateRef.current.isMuted ? 0 : stateRef.current.volume;
+            if (resumeAt > 0.5 && Number.isFinite(audio.duration) && resumeAt < audio.duration) {
+              try {
+                audio.currentTime = resumeAt;
+              } catch {
+                // Ignore
+              }
+            }
+            audio
+              .play()
+              .then(() => {
+                clearStallWatchdog();
+                setIsPlaying(true);
+                setIsLoading(false);
+              })
+              .catch(() => {
+                void recoverPlaybackRef.current('handoff-rejected');
+              });
+          } else {
+            startNativeAudio(targetAudioUrl, resumeAt, true);
+          }
         }
-      } else if (backgroundHandoffActiveRef.current) {
-        backgroundHandoffActiveRef.current = false;
+        return;
+      }
+
+      // Foreground return: !document.hidden
+      if (!currentTrackRef.current) return;
+
+      if (userWantsPlayingRef.current) {
+        ensureAudioContext();
+      }
+
+      if (backgroundHandoffActiveRef.current) {
+        const resumeAt = Math.max(audio.currentTime || 0, lastKnownTimeRef.current || 0);
+        lastKnownTimeRef.current = resumeAt;
+        const shouldPlay = userWantsPlayingRef.current;
         if (stateRef.current.playMode === 'video' && videoUrl) {
-          const resumeAt = audio.currentTime;
-          const wasPlaying = !audio.paused;
           audio.pause();
-          startNativeVideo(videoUrl, resumeAt, wasPlaying);
+          backgroundHandoffActiveRef.current = false;
+          startNativeVideo(videoUrl, resumeAt, shouldPlay);
+          return;
         }
+        backgroundHandoffActiveRef.current = false;
+      }
+
+      if (userWantsPlayingRef.current) {
+        const eng = stateRef.current.activeEngine;
+        if (eng === 'native-audio') {
+          if (audio.error || !audio.src || audio.networkState === HTMLMediaElement.NETWORK_NO_SOURCE) {
+            void recoverPlaybackRef.current('foreground-error');
+          } else if (audio.paused) {
+            scheduleStallWatchdog();
+            audio
+              .play()
+              .then(() => {
+                clearStallWatchdog();
+                setIsPlaying(true);
+                setIsLoading(false);
+              })
+              .catch((err: DOMException | Error) => {
+                if (err?.name === 'NotAllowedError') {
+                  clearStallWatchdog();
+                  setIsLoading(false);
+                  setIsPlaying(false);
+                } else {
+                  void recoverPlaybackRef.current('foreground-resume');
+                }
+              });
+          } else if (audio.readyState >= 3) {
+            clearStallWatchdog();
+            setIsLoading(false);
+            setIsPlaying(true);
+          }
+        } else if (eng === 'native-video') {
+          if (video.error || !video.src || video.networkState === HTMLMediaElement.NETWORK_NO_SOURCE) {
+            void recoverPlaybackRef.current('foreground-video-error');
+          } else if (video.paused) {
+            scheduleStallWatchdog();
+            video
+              .play()
+              .then(() => {
+                clearStallWatchdog();
+                setIsPlaying(true);
+                setIsLoading(false);
+              })
+              .catch((err: DOMException | Error) => {
+                if (err?.name === 'NotAllowedError') {
+                  clearStallWatchdog();
+                  setIsLoading(false);
+                  setIsPlaying(false);
+                } else {
+                  void recoverPlaybackRef.current('foreground-video-resume');
+                }
+              });
+          } else if (video.readyState >= 3) {
+            clearStallWatchdog();
+            setIsLoading(false);
+            setIsPlaying(true);
+          }
+        } else if (eng === 'yt-privacy' && ytPlayerRef.current && ytReadyRef.current) {
+          try {
+            ytPlayerRef.current.playVideo();
+          } catch {
+            // Ignore
+          }
+        }
+      } else {
+        // Ensure spinner isn't stuck if user paused while screen was off
+        clearStallWatchdog();
+        setIsLoading(false);
       }
     };
 
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [startNativeAudio, startNativeVideo]);
+    const onFocusOrPageShow = () => {
+      if (!document.hidden) {
+        handleBackgroundTransition();
+      }
+    };
 
-  // Attach native <audio> listeners
+    document.addEventListener('visibilitychange', handleBackgroundTransition);
+    window.addEventListener('pageshow', onFocusOrPageShow);
+    window.addEventListener('focus', onFocusOrPageShow);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleBackgroundTransition);
+      window.removeEventListener('pageshow', onFocusOrPageShow);
+      window.removeEventListener('focus', onFocusOrPageShow);
+    };
+  }, [
+    clearStallWatchdog,
+    ensureAudioContext,
+    scheduleStallWatchdog,
+    startNativeAudio,
+    startNativeVideo,
+  ]);
+
+  // Attach native <audio> listeners (never dependent on currentTime to avoid re-attaching every 250ms)
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
 
+    const isUnlockSample = () =>
+      isUnlockingAudioRef.current || (audio.getAttribute('src') || '').startsWith('data:audio/wav');
+
     const onTimeUpdate = () => {
-      if (stateRef.current.activeEngine !== 'native-audio') return;
+      if (isUnlockSample() || stateRef.current.activeEngine !== 'native-audio') return;
       const now = audio.currentTime;
+      lastKnownTimeRef.current = now;
       setCurrentTime(now);
       if (audio.buffered.length > 0) {
         setBuffered(audio.buffered.end(audio.buffered.length - 1));
       }
+      if (!audio.paused && audio.readyState >= 3) {
+        clearStallWatchdog();
+        setIsLoading(false);
+      }
+      const perfNow = Date.now();
+      if (perfNow - lastPositionSyncAtRef.current >= 900) {
+        lastPositionSyncAtRef.current = perfNow;
+        syncMediaSessionPosition(now, audio.duration);
+      }
       checkSponsorSkip(now, audio.duration, (target) => {
         audio.currentTime = target;
+        if (userWantsPlayingRef.current && audio.paused) {
+          audio.play().catch(() => {});
+        }
       });
     };
 
     const onLoadedMeta = () => {
-      if (stateRef.current.activeEngine !== 'native-audio') return;
-      if (Number.isFinite(audio.duration) && audio.duration > 0) setDuration(audio.duration);
-      setIsLoading(false);
-    };
-
-    const onPlay = () => {
-      if (stateRef.current.activeEngine === 'native-audio') {
-        setIsPlaying(true);
+      if (isUnlockSample() || stateRef.current.activeEngine !== 'native-audio') return;
+      if (Number.isFinite(audio.duration) && audio.duration > 0) {
+        setDuration(audio.duration);
+        syncMediaSessionPosition(audio.currentTime, audio.duration);
+      }
+      if (!userWantsPlayingRef.current || audio.readyState >= 3) {
         setIsLoading(false);
       }
     };
+
+    const onPlay = () => {
+      if (isUnlockSample()) return;
+      if (stateRef.current.activeEngine === 'native-audio') {
+        setIsPlaying(true);
+        if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+          navigator.mediaSession.playbackState = 'playing';
+        }
+        syncMediaSessionPosition(audio.currentTime, audio.duration);
+      }
+    };
+
+    const onPlaying = () => {
+      if (isUnlockSample()) return;
+      if (stateRef.current.activeEngine === 'native-audio') {
+        recoveryAttemptsRef.current = 0;
+        clearStallWatchdog();
+        setIsPlaying(true);
+        setIsLoading(false);
+        if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+          navigator.mediaSession.playbackState = 'playing';
+        }
+        syncMediaSessionPosition(audio.currentTime, audio.duration);
+      }
+    };
+
     const onPause = () => {
-      if (stateRef.current.activeEngine === 'native-audio') setIsPlaying(false);
+      if (isUnlockSample() || stateRef.current.activeEngine !== 'native-audio') return;
+      // Do not clear userWantsPlayingRef here — OS pauses on screen-off / tab switch / interruption
+      // must remain recoverable when returning or tapping lock-screen Play.
+      if (!backgroundHandoffActiveRef.current) {
+        clearStallWatchdog();
+        setIsPlaying(false);
+        setIsLoading(false);
+        if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+          navigator.mediaSession.playbackState = 'paused';
+        }
+        syncMediaSessionPosition(audio.currentTime, audio.duration);
+      }
     };
+
     const onWaiting = () => {
-      if (stateRef.current.activeEngine === 'native-audio') setIsLoading(true);
+      if (isUnlockSample() || stateRef.current.activeEngine !== 'native-audio') return;
+      if (userWantsPlayingRef.current) {
+        setIsLoading(true);
+        scheduleStallWatchdog();
+      }
     };
+
+    const onStalled = () => {
+      if (isUnlockSample() || stateRef.current.activeEngine !== 'native-audio') return;
+      if (userWantsPlayingRef.current && (audio.paused || audio.readyState < 3)) {
+        setIsLoading(true);
+        scheduleStallWatchdog();
+      }
+    };
+
+    const onSuspend = () => {
+      if (isUnlockSample() || stateRef.current.activeEngine !== 'native-audio') return;
+      // Browsers fire suspend normally when buffer is full; only schedule recovery if playback actually stopped unexpectedly
+      if (userWantsPlayingRef.current && (audio.paused || audio.readyState < 2)) {
+        scheduleStallWatchdog();
+      }
+    };
+
     const onCanPlay = () => {
-      if (stateRef.current.activeEngine === 'native-audio') setIsLoading(false);
+      if (isUnlockSample() || stateRef.current.activeEngine !== 'native-audio') return;
+      clearStallWatchdog();
+      setIsLoading(false);
     };
+
+    const onSeeked = () => {
+      if (isUnlockSample() || stateRef.current.activeEngine !== 'native-audio') return;
+      if (audio.readyState >= 3 || !userWantsPlayingRef.current) {
+        clearStallWatchdog();
+        setIsLoading(false);
+      }
+      syncMediaSessionPosition(audio.currentTime, audio.duration);
+    };
+
     const onEnded = () => {
+      if (isUnlockSample()) return;
       if (stateRef.current.activeEngine === 'native-audio') handleTrackEndedRef.current();
     };
+
     const onError = () => {
-      if (!currentTrack || stateRef.current.activeEngine !== 'native-audio') return;
-      if (mediaUrlsRef.current.videoUrl && audio.getAttribute('data-stream-url') !== mediaUrlsRef.current.videoUrl) {
-        startNativeAudio(mediaUrlsRef.current.videoUrl, currentTime, true);
+      if (isUnlockSample()) return;
+      const track = currentTrackRef.current;
+      if (!track || stateRef.current.activeEngine !== 'native-audio') return;
+      if (userWantsPlayingRef.current) {
+        void recoverPlaybackRef.current('audio-error');
       } else {
-        setStreamSourceLabel('Nguồn dự phòng YouTube (luồng âm thanh gặp sự cố)');
-        void ensureYtPlayer(currentTrack.id, currentTime);
+        clearStallWatchdog();
+        setIsLoading(false);
+        setIsPlaying(false);
       }
     };
 
     audio.addEventListener('timeupdate', onTimeUpdate);
     audio.addEventListener('loadedmetadata', onLoadedMeta);
     audio.addEventListener('play', onPlay);
+    audio.addEventListener('playing', onPlaying);
     audio.addEventListener('pause', onPause);
     audio.addEventListener('waiting', onWaiting);
+    audio.addEventListener('stalled', onStalled);
+    audio.addEventListener('suspend', onSuspend);
     audio.addEventListener('canplay', onCanPlay);
+    audio.addEventListener('seeked', onSeeked);
     audio.addEventListener('ended', onEnded);
     audio.addEventListener('error', onError);
 
@@ -748,15 +1456,19 @@ export function useMediaEngine({
       audio.removeEventListener('timeupdate', onTimeUpdate);
       audio.removeEventListener('loadedmetadata', onLoadedMeta);
       audio.removeEventListener('play', onPlay);
+      audio.removeEventListener('playing', onPlaying);
       audio.removeEventListener('pause', onPause);
       audio.removeEventListener('waiting', onWaiting);
+      audio.removeEventListener('stalled', onStalled);
+      audio.removeEventListener('suspend', onSuspend);
       audio.removeEventListener('canplay', onCanPlay);
+      audio.removeEventListener('seeked', onSeeked);
       audio.removeEventListener('ended', onEnded);
       audio.removeEventListener('error', onError);
     };
-  }, [checkSponsorSkip, currentTime, currentTrack, ensureYtPlayer, startNativeAudio]);
+  }, [checkSponsorSkip, clearStallWatchdog, scheduleStallWatchdog, syncMediaSessionPosition]);
 
-  // Attach native <video> listeners
+  // Attach native <video> listeners (never dependent on currentTime)
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -764,53 +1476,139 @@ export function useMediaEngine({
     const onTimeUpdate = () => {
       if (stateRef.current.activeEngine !== 'native-video') return;
       const now = video.currentTime;
+      lastKnownTimeRef.current = now;
       setCurrentTime(now);
       if (video.buffered.length > 0) {
         setBuffered(video.buffered.end(video.buffered.length - 1));
       }
+      if (!video.paused && video.readyState >= 3) {
+        clearStallWatchdog();
+        setIsLoading(false);
+      }
+      const perfNow = Date.now();
+      if (perfNow - lastPositionSyncAtRef.current >= 900) {
+        lastPositionSyncAtRef.current = perfNow;
+        syncMediaSessionPosition(now, video.duration);
+      }
       checkSponsorSkip(now, video.duration, (target) => {
         video.currentTime = target;
+        if (userWantsPlayingRef.current && video.paused) {
+          video.play().catch(() => {});
+        }
       });
     };
 
     const onLoadedMeta = () => {
       if (stateRef.current.activeEngine !== 'native-video') return;
-      if (Number.isFinite(video.duration) && video.duration > 0) setDuration(video.duration);
-      setIsLoading(false);
+      if (Number.isFinite(video.duration) && video.duration > 0) {
+        setDuration(video.duration);
+        syncMediaSessionPosition(video.currentTime, video.duration);
+      }
+      if (!userWantsPlayingRef.current || video.readyState >= 3) {
+        setIsLoading(false);
+      }
     };
 
     const onPlay = () => {
       if (stateRef.current.activeEngine === 'native-video') {
         setIsPlaying(true);
+        if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+          navigator.mediaSession.playbackState = 'playing';
+        }
+        syncMediaSessionPosition(video.currentTime, video.duration);
+      }
+    };
+
+    const onPlaying = () => {
+      if (stateRef.current.activeEngine === 'native-video') {
+        recoveryAttemptsRef.current = 0;
+        clearStallWatchdog();
+        setIsPlaying(true);
+        setIsLoading(false);
+        if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+          navigator.mediaSession.playbackState = 'playing';
+        }
+        syncMediaSessionPosition(video.currentTime, video.duration);
+      }
+    };
+
+    const onPause = () => {
+      if (stateRef.current.activeEngine !== 'native-video') return;
+      if (!backgroundHandoffActiveRef.current) {
+        clearStallWatchdog();
+        setIsPlaying(false);
+        setIsLoading(false);
+        if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+          navigator.mediaSession.playbackState = 'paused';
+        }
+        syncMediaSessionPosition(video.currentTime, video.duration);
+      }
+    };
+
+    const onWaiting = () => {
+      if (stateRef.current.activeEngine !== 'native-video') return;
+      if (userWantsPlayingRef.current) {
+        setIsLoading(true);
+        scheduleStallWatchdog();
+      }
+    };
+
+    const onStalled = () => {
+      if (stateRef.current.activeEngine !== 'native-video') return;
+      if (userWantsPlayingRef.current && (video.paused || video.readyState < 3)) {
+        setIsLoading(true);
+        scheduleStallWatchdog();
+      }
+    };
+
+    const onSuspend = () => {
+      if (stateRef.current.activeEngine !== 'native-video') return;
+      if (userWantsPlayingRef.current && (video.paused || video.readyState < 2)) {
+        scheduleStallWatchdog();
+      }
+    };
+
+    const onCanPlay = () => {
+      if (stateRef.current.activeEngine !== 'native-video') return;
+      clearStallWatchdog();
+      setIsLoading(false);
+    };
+
+    const onSeeked = () => {
+      if (stateRef.current.activeEngine !== 'native-video') return;
+      if (video.readyState >= 3 || !userWantsPlayingRef.current) {
+        clearStallWatchdog();
         setIsLoading(false);
       }
+      syncMediaSessionPosition(video.currentTime, video.duration);
     };
-    const onPause = () => {
-      if (stateRef.current.activeEngine === 'native-video' && !backgroundHandoffActiveRef.current) {
-        setIsPlaying(false);
-      }
-    };
-    const onWaiting = () => {
-      if (stateRef.current.activeEngine === 'native-video') setIsLoading(true);
-    };
-    const onCanPlay = () => {
-      if (stateRef.current.activeEngine === 'native-video') setIsLoading(false);
-    };
+
     const onEnded = () => {
       if (stateRef.current.activeEngine === 'native-video') handleTrackEndedRef.current();
     };
+
     const onError = () => {
-      if (!currentTrack || stateRef.current.activeEngine !== 'native-video') return;
-      setStreamSourceLabel('Nguồn dự phòng YouTube (luồng video gặp sự cố)');
-      void ensureYtPlayer(currentTrack.id, currentTime);
+      const track = currentTrackRef.current;
+      if (!track || stateRef.current.activeEngine !== 'native-video') return;
+      if (userWantsPlayingRef.current) {
+        void recoverPlaybackRef.current('video-error');
+      } else {
+        clearStallWatchdog();
+        setIsLoading(false);
+        setIsPlaying(false);
+      }
     };
 
     video.addEventListener('timeupdate', onTimeUpdate);
     video.addEventListener('loadedmetadata', onLoadedMeta);
     video.addEventListener('play', onPlay);
+    video.addEventListener('playing', onPlaying);
     video.addEventListener('pause', onPause);
     video.addEventListener('waiting', onWaiting);
+    video.addEventListener('stalled', onStalled);
+    video.addEventListener('suspend', onSuspend);
     video.addEventListener('canplay', onCanPlay);
+    video.addEventListener('seeked', onSeeked);
     video.addEventListener('ended', onEnded);
     video.addEventListener('error', onError);
 
@@ -818,13 +1616,17 @@ export function useMediaEngine({
       video.removeEventListener('timeupdate', onTimeUpdate);
       video.removeEventListener('loadedmetadata', onLoadedMeta);
       video.removeEventListener('play', onPlay);
+      video.removeEventListener('playing', onPlaying);
       video.removeEventListener('pause', onPause);
       video.removeEventListener('waiting', onWaiting);
+      video.removeEventListener('stalled', onStalled);
+      video.removeEventListener('suspend', onSuspend);
       video.removeEventListener('canplay', onCanPlay);
+      video.removeEventListener('seeked', onSeeked);
       video.removeEventListener('ended', onEnded);
       video.removeEventListener('error', onError);
     };
-  }, [checkSponsorSkip, currentTime, currentTrack, ensureYtPlayer]);
+  }, [checkSponsorSkip, clearStallWatchdog, scheduleStallWatchdog, syncMediaSessionPosition]);
 
   // Poll YT Privacy Engine progress & SponsorBlock watcher at 250ms when active
   useEffect(() => {
@@ -838,12 +1640,18 @@ export function useMediaEngine({
         const dur = p.getDuration();
         const frac = p.getVideoLoadedFraction();
         if (Number.isFinite(now)) {
+          lastKnownTimeRef.current = now;
           setCurrentTime(now);
           checkSponsorSkip(now, dur, (target) => p.seekTo(target, true));
         }
         if (Number.isFinite(dur) && dur > 0) {
           setDuration(dur);
           if (Number.isFinite(frac)) setBuffered(dur * frac);
+          const perfNow = Date.now();
+          if (Number.isFinite(now) && perfNow - lastPositionSyncAtRef.current >= 900) {
+            lastPositionSyncAtRef.current = perfNow;
+            syncMediaSessionPosition(now, dur);
+          }
         }
       } catch {
         // Player transitioning
@@ -851,7 +1659,7 @@ export function useMediaEngine({
     }, 250);
 
     return () => window.clearInterval(timer);
-  }, [activeEngine, checkSponsorSkip, currentTrack]);
+  }, [activeEngine, checkSponsorSkip, currentTrack, syncMediaSessionPosition]);
 
   // Sync volume & playback rate across ALL 3 engines
   useEffect(() => {
@@ -915,8 +1723,10 @@ export function useMediaEngine({
       setSleepRemainingSec(rem);
       if (rem <= 0) {
         setSleepEndsAt(null);
+        userWantsPlayingRef.current = false;
         stopAllEngines();
         setIsPlaying(false);
+        setIsLoading(false);
         onNotice('Hẹn giờ tắt đã dừng phát nhạc.');
       }
     };
@@ -925,25 +1735,129 @@ export function useMediaEngine({
     return () => window.clearInterval(id);
   }, [sleepEndsAt, onNotice, stopAllEngines]);
 
+  // Try upgrading from fallback yt-privacy iframe back to native background-capable stream
+  const retryNativeStream = useCallback(async (): Promise<boolean> => {
+    const track = currentTrackRef.current;
+    if (!track || isRetryingNativeRef.current) return false;
+
+    unlockAudioSync();
+    isRetryingNativeRef.current = true;
+    setIsRetryingNative(true);
+
+    const trackIdAtStart = track.id;
+    const resumeAt =
+      stateRef.current.activeEngine === 'yt-privacy'
+        ? ytPlayerRef.current?.getCurrentTime?.() || lastKnownTimeRef.current || 0
+        : lastKnownTimeRef.current || 0;
+
+    try {
+      const resolved = await resolveTrackStreams(trackIdAtStart);
+      if (currentTrackRef.current?.id !== trackIdAtStart) return false;
+
+      if (resolved.audioUrl || resolved.videoUrl) {
+        mediaUrlsRef.current = resolved;
+        setStreamSourceLabel(resolved.sourceLabel);
+
+        const preferVideo =
+          stateRef.current.playMode === 'video' && !document.hidden && Boolean(resolved.videoUrl);
+        if (preferVideo && resolved.videoUrl) {
+          startNativeVideo(resolved.videoUrl, resumeAt, true, true);
+          return true;
+        }
+        const audioCandidate = resolved.audioUrl || resolved.videoUrl;
+        if (audioCandidate) {
+          startNativeAudio(audioCandidate, resumeAt, true, true);
+          return true;
+        }
+      }
+      return false;
+    } finally {
+      isRetryingNativeRef.current = false;
+      setIsRetryingNative(false);
+    }
+  }, [resolveTrackStreams, startNativeAudio, startNativeVideo, unlockAudioSync]);
+
+  const retryNativeStreamRef = useRef<() => Promise<boolean>>(async () => false);
+  retryNativeStreamRef.current = retryNativeStream;
+
   // Unified Transport Controls
   const togglePlay = useCallback(() => {
-    if (!currentTrack) return;
+    if (!currentTrackRef.current) return;
+    unlockAudioSync();
     const eng = stateRef.current.activeEngine;
+
     if (eng === 'native-audio' && audioRef.current) {
-      if (audioRef.current.paused) audioRef.current.play().catch(() => {});
-      else audioRef.current.pause();
+      const audio = audioRef.current;
+      if (audio.paused) {
+        userWantsPlayingRef.current = true;
+        recoveryAttemptsRef.current = 0;
+        if (!audio.src || audio.src.startsWith('data:audio/wav') || audio.error || audio.networkState === HTMLMediaElement.NETWORK_NO_SOURCE) {
+          void recoverPlaybackRef.current('toggle-play-empty');
+          return;
+        }
+        scheduleStallWatchdog();
+        audio
+          .play()
+          .then(() => {
+            clearStallWatchdog();
+            setIsPlaying(true);
+            setIsLoading(false);
+          })
+          .catch(() => {
+            void recoverPlaybackRef.current('toggle-play-rejected');
+          });
+      } else {
+        userWantsPlayingRef.current = false;
+        clearStallWatchdog();
+        setIsLoading(false);
+        audio.pause();
+      }
     } else if (eng === 'native-video' && videoRef.current) {
-      if (videoRef.current.paused) videoRef.current.play().catch(() => {});
-      else videoRef.current.pause();
-    } else if (ytPlayerRef.current && ytReadyRef.current) {
-      if (isPlaying) ytPlayerRef.current.pauseVideo();
-      else ytPlayerRef.current.playVideo();
+      const video = videoRef.current;
+      if (video.paused) {
+        userWantsPlayingRef.current = true;
+        recoveryAttemptsRef.current = 0;
+        if (!video.src || video.error || video.networkState === HTMLMediaElement.NETWORK_NO_SOURCE) {
+          void recoverPlaybackRef.current('toggle-video-empty');
+          return;
+        }
+        scheduleStallWatchdog();
+        video
+          .play()
+          .then(() => {
+            clearStallWatchdog();
+            setIsPlaying(true);
+            setIsLoading(false);
+          })
+          .catch(() => {
+            void recoverPlaybackRef.current('toggle-video-rejected');
+          });
+      } else {
+        userWantsPlayingRef.current = false;
+        clearStallWatchdog();
+        setIsLoading(false);
+        video.pause();
+      }
+    } else if (eng === 'yt-privacy') {
+      if (stateRef.current.isPlaying) {
+        userWantsPlayingRef.current = false;
+        ytPlayerRef.current?.pauseVideo?.();
+      } else {
+        userWantsPlayingRef.current = true;
+        if (ytPlayerRef.current && ytReadyRef.current) {
+          ytPlayerRef.current.playVideo();
+        }
+        // Automatically try upgrading from iframe fallback to native stream on Play tap
+        void retryNativeStream();
+      }
     }
-  }, [currentTrack, isPlaying]);
+  }, [clearStallWatchdog, retryNativeStream, scheduleStallWatchdog, unlockAudioSync]);
 
   const seekTo = useCallback(
     (seconds: number) => {
-      const clamped = Math.max(0, Math.min(seconds, duration || seconds));
+      ensureAudioContext();
+      const dur = stateRef.current.duration;
+      const clamped = Math.max(0, Math.min(seconds, dur || seconds));
       const eng = stateRef.current.activeEngine;
       if (eng === 'native-audio' && audioRef.current) {
         audioRef.current.currentTime = clamped;
@@ -952,55 +1866,61 @@ export function useMediaEngine({
       } else if (ytPlayerRef.current && ytReadyRef.current) {
         ytPlayerRef.current.seekTo(clamped, true);
       }
+      lastKnownTimeRef.current = clamped;
       setCurrentTime(clamped);
+      syncMediaSessionPosition(clamped);
     },
-    [duration]
+    [ensureAudioContext, syncMediaSessionPosition]
   );
 
   const skipBy = useCallback(
     (delta: number) => {
-      seekTo(currentTime + delta);
+      seekTo(lastKnownTimeRef.current + delta);
     },
-    [currentTime, seekTo]
+    [seekTo]
   );
 
   // Seamless Audio <-> Video switch preserving exact playback second
   const switchPlayMode = useCallback(
     (targetMode: PlayMode) => {
       if (targetMode === playMode) return;
+      unlockAudioSync();
       setPlayMode(targetMode);
-      if (!currentTrack) return;
+      const track = currentTrackRef.current;
+      if (!track) return;
 
+      recoveryAttemptsRef.current = 0;
+      backgroundHandoffActiveRef.current = false;
       const { audioUrl, videoUrl } = mediaUrlsRef.current;
-      const wasPlaying = stateRef.current.isPlaying;
+      const wasPlaying = userWantsPlayingRef.current || stateRef.current.isPlaying;
 
       if (targetMode === 'video') {
         if (videoUrl) {
           const resumeAt =
             stateRef.current.activeEngine === 'native-audio'
-              ? audioRef.current?.currentTime || currentTime
-              : currentTime;
+              ? audioRef.current?.currentTime || lastKnownTimeRef.current
+              : lastKnownTimeRef.current;
           setIsLoading(true);
           startNativeVideo(videoUrl, resumeAt, wasPlaying);
         } else if (stateRef.current.activeEngine !== 'yt-privacy') {
-          const resumeAt = audioRef.current?.currentTime || currentTime;
-          void ensureYtPlayer(currentTrack.id, resumeAt);
+          const resumeAt = audioRef.current?.currentTime || lastKnownTimeRef.current;
+          void ensureYtPlayer(track.id, resumeAt);
         }
       } else {
         if (audioUrl) {
           const resumeAt =
             stateRef.current.activeEngine === 'native-video'
-              ? videoRef.current?.currentTime || currentTime
+              ? videoRef.current?.currentTime || lastKnownTimeRef.current
               : stateRef.current.activeEngine === 'yt-privacy'
-              ? ytPlayerRef.current?.getCurrentTime?.() || currentTime
-              : currentTime;
+              ? ytPlayerRef.current?.getCurrentTime?.() || lastKnownTimeRef.current
+              : lastKnownTimeRef.current;
           setIsLoading(true);
           startNativeAudio(audioUrl, resumeAt, wasPlaying);
         }
         // If only yt-privacy is available, playMode switches cleanly to Audio-Focus view with 0ms reload
       }
     },
-    [currentTime, currentTrack, ensureYtPlayer, playMode, startNativeAudio, startNativeVideo]
+    [ensureYtPlayer, playMode, startNativeAudio, startNativeVideo, unlockAudioSync]
   );
 
   // Native Picture-in-Picture (floating video window on Desktop & iOS/Android)
@@ -1033,16 +1953,20 @@ export function useMediaEngine({
     }
   }, [onNotice]);
 
-  // Lock-Screen Media Session API (iOS, Android, macOS, Windows)
+  // 1. Lock-Screen Media Session Metadata (updates only when track changes)
   useEffect(() => {
-    if (!('mediaSession' in navigator) || !currentTrack) return;
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    if (!currentTrack) {
+      navigator.mediaSession.metadata = null;
+      return;
+    }
 
     const thumb =
       currentTrack.thumbnail || `https://i.ytimg.com/vi/${currentTrack.id}/hqdefault.jpg`;
     navigator.mediaSession.metadata = new MediaMetadata({
       title: currentTrack.title,
       artist: currentTrack.author,
-      album: 'PureStream · Không quảng cáo',
+      album: 'Music Tube · Không quảng cáo',
       artwork: [
         { src: thumb, sizes: '320x180', type: 'image/jpeg' },
         {
@@ -1057,28 +1981,137 @@ export function useMediaEngine({
         },
       ],
     });
+  }, [currentTrack]);
 
-    navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+  // 2. Lock-Screen Media Session PlaybackState sync
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    navigator.mediaSession.playbackState = currentTrack
+      ? isPlaying
+        ? 'playing'
+        : 'paused'
+      : 'none';
+  }, [currentTrack, isPlaying]);
+
+  // 3. Stable Lock-Screen Media Session Action Handlers (never torn down on timeupdate)
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    if (!currentTrack) return;
 
     const safeSet = (action: MediaSessionAction, handler: MediaSessionActionHandler | null) => {
       try {
         navigator.mediaSession.setActionHandler(action, handler);
       } catch {
-        // Unsupported
+        // Unsupported action on this browser
       }
     };
 
     safeSet('play', () => {
+      ensureAudioContext();
+      userWantsPlayingRef.current = true;
+      recoveryAttemptsRef.current = 0;
+
       const eng = stateRef.current.activeEngine;
-      if (eng === 'native-audio') audioRef.current?.play().catch(() => {});
-      else if (eng === 'native-video') videoRef.current?.play().catch(() => {});
-      else ytPlayerRef.current?.playVideo?.();
-      setIsPlaying(true);
+      const audio = audioRef.current;
+      const video = videoRef.current;
+
+      if (eng === 'yt-privacy') {
+        if (!document.hidden) {
+          ytPlayerRef.current?.playVideo?.();
+        } else {
+          // iOS Safari pauses iframe playback in background; keep honest paused state until native stream succeeds
+          navigator.mediaSession.playbackState = 'paused';
+          setIsPlaying(false);
+        }
+        void retryNativeStreamRef.current().then((ok) => {
+          if (!ok && document.hidden) {
+            navigator.mediaSession.playbackState = 'paused';
+            setIsPlaying(false);
+            onNotice(
+              'Bài này đang dùng iframe dự phòng nên iPhone không thể phát khi tắt màn hình. Hãy mở app để đổi bài hoặc thử lấy luồng gốc.'
+            );
+          }
+        });
+        return;
+      }
+
+      // If locked/hidden while in native-video mode (not PiP/fullscreen), hand off and call audio.play() SYNCHRONOUSLY
+      const isInPiP = video ? document.pictureInPictureElement === video : false;
+      const webkitVideo = video as unknown as { webkitPresentationMode?: string } | null;
+      const isVideoFullscreen = video
+        ? document.fullscreenElement === video || webkitVideo?.webkitPresentationMode === 'fullscreen'
+        : false;
+
+      if (document.hidden && eng === 'native-video' && !isInPiP && !isVideoFullscreen && audio) {
+        const { audioUrl, videoUrl } = mediaUrlsRef.current;
+        const targetAudioUrl = audioUrl || videoUrl;
+        const resumeAt = Math.max(video?.currentTime || 0, lastKnownTimeRef.current || 0);
+        lastKnownTimeRef.current = resumeAt;
+        backgroundHandoffActiveRef.current = true;
+        video?.pause();
+        setActiveEngine('native-audio');
+
+        if (targetAudioUrl && audio.getAttribute('data-stream-url') !== targetAudioUrl) {
+          audio.preload = 'auto';
+          audio.setAttribute('data-stream-url', targetAudioUrl);
+          audio.src = targetAudioUrl;
+        }
+        if (resumeAt > 0.5 && Number.isFinite(audio.duration) && resumeAt < audio.duration) {
+          try {
+            audio.currentTime = resumeAt;
+          } catch {
+            // Seek after reload if needed
+          }
+        }
+        navigator.mediaSession.playbackState = 'playing';
+        const p = audio.play();
+        if (p && typeof p.then === 'function') {
+          p.then(() => {
+            clearStallWatchdog();
+            setIsPlaying(true);
+            setIsLoading(false);
+          }).catch(() => {
+            void recoverPlaybackRef.current('mediasession-play-video-handoff');
+          });
+        }
+        return;
+      }
+
+      const activeEl = eng === 'native-video' ? video : audio;
+      if (!activeEl) return;
+
+      // Always call play() SYNCHRONOUSLY first inside the handler before any async recovery
+      const currentSrc = activeEl.getAttribute('src') || '';
+      if (!currentSrc || currentSrc.startsWith('data:audio/wav')) {
+        void recoverPlaybackRef.current('mediasession-play-empty');
+        return;
+      }
+
+      navigator.mediaSession.playbackState = 'playing';
+      scheduleStallWatchdog();
+      const playPromise = activeEl.play();
+      if (playPromise && typeof playPromise.then === 'function') {
+        playPromise
+          .then(() => {
+            clearStallWatchdog();
+            setIsPlaying(true);
+            setIsLoading(false);
+          })
+          .catch(() => {
+            void recoverPlaybackRef.current('mediasession-play-rejected');
+          });
+      }
     });
+
     safeSet('pause', () => {
+      userWantsPlayingRef.current = false;
+      clearStallWatchdog();
       stopAllEngines();
       setIsPlaying(false);
+      setIsLoading(false);
+      navigator.mediaSession.playbackState = 'paused';
     });
+
     safeSet('previoustrack', () => playPrev());
     safeSet('nexttrack', () => playNext());
     safeSet('seekbackward', (d) => skipBy(-(d.seekOffset || 10)));
@@ -1087,24 +2120,30 @@ export function useMediaEngine({
       if (typeof d.seekTime === 'number') seekTo(d.seekTime);
     });
     safeSet('stop', () => {
+      userWantsPlayingRef.current = false;
+      clearStallWatchdog();
       stopAllEngines();
       setIsPlaying(false);
+      setIsLoading(false);
+      navigator.mediaSession.playbackState = 'none';
     });
-  }, [currentTrack, isPlaying, playNext, playPrev, seekTo, skipBy, stopAllEngines]);
+  }, [
+    clearStallWatchdog,
+    currentTrack,
+    ensureAudioContext,
+    onNotice,
+    playNext,
+    playPrev,
+    scheduleStallWatchdog,
+    seekTo,
+    skipBy,
+    stopAllEngines,
+  ]);
 
+  // 4. Lock-Screen Media Session PositionState sync
   useEffect(() => {
-    if (!('mediaSession' in navigator) || !('setPositionState' in navigator.mediaSession)) return;
-    if (!duration || duration <= 0) return;
-    try {
-      navigator.mediaSession.setPositionState({
-        duration,
-        playbackRate,
-        position: Math.min(Math.max(0, currentTime), duration),
-      });
-    } catch {
-      // Ignore transient invalid state
-    }
-  }, [currentTime, duration, playbackRate]);
+    syncMediaSessionPosition(currentTime, duration);
+  }, [currentTime, duration, playbackRate, syncMediaSessionPosition]);
 
   useEffect(() => {
     return () => {
@@ -1114,30 +2153,37 @@ export function useMediaEngine({
   }, []);
 
   // Queue Actions
-  const playTrack = useCallback((track: TrackItem, list?: TrackItem[]) => {
-    if (list && list.length > 0) {
-      const idx = list.findIndex((t) => t.id === track.id);
-      if (idx >= 0) {
-        setQueue(list);
-        setCurrentIndex(idx);
+  const playTrack = useCallback(
+    (track: TrackItem, list?: TrackItem[]) => {
+      unlockAudioSync();
+      userWantsPlayingRef.current = true;
+      recoveryAttemptsRef.current = 0;
+
+      if (list && list.length > 0) {
+        const idx = list.findIndex((t) => t.id === track.id);
+        if (idx >= 0) {
+          setQueue(list);
+          setCurrentIndex(idx);
+          return;
+        }
+        setQueue([track, ...list]);
+        setCurrentIndex(0);
         return;
       }
-      setQueue([track, ...list]);
-      setCurrentIndex(0);
-      return;
-    }
 
-    setQueue((prev) => {
-      const existing = prev.findIndex((t) => t.id === track.id);
-      if (existing >= 0) {
-        setCurrentIndex(existing);
-        return prev;
-      }
-      const nextQueue = [...prev, track];
-      setCurrentIndex(nextQueue.length - 1);
-      return nextQueue;
-    });
-  }, []);
+      setQueue((prev) => {
+        const existing = prev.findIndex((t) => t.id === track.id);
+        if (existing >= 0) {
+          setCurrentIndex(existing);
+          return prev;
+        }
+        const nextQueue = [...prev, track];
+        setCurrentIndex(nextQueue.length - 1);
+        return nextQueue;
+      });
+    },
+    [unlockAudioSync]
+  );
 
   const addToQueue = useCallback(
     (track: TrackItem) => {
@@ -1147,11 +2193,15 @@ export function useMediaEngine({
           return prev;
         }
         onNotice('Đã thêm vào hàng đợi phát.');
-        if (prev.length === 0) setCurrentIndex(0);
+        if (prev.length === 0) {
+          unlockAudioSync();
+          userWantsPlayingRef.current = true;
+          setCurrentIndex(0);
+        }
         return [...prev, track];
       });
     },
-    [onNotice]
+    [onNotice, unlockAudioSync]
   );
 
   const removeFromQueue = useCallback(
@@ -1162,10 +2212,13 @@ export function useMediaEngine({
           setCurrentIndex((c) => c - 1);
         } else if (index === currentIndex) {
           if (next.length === 0) {
+            userWantsPlayingRef.current = false;
             setCurrentIndex(-1);
             stopAllEngines();
             setIsPlaying(false);
+            setIsLoading(false);
           } else {
+            userWantsPlayingRef.current = true;
             setCurrentIndex(Math.min(index, next.length - 1));
           }
         }
@@ -1175,9 +2228,15 @@ export function useMediaEngine({
     [currentIndex, stopAllEngines]
   );
 
-  const selectQueueIndex = useCallback((index: number) => {
-    setCurrentIndex(index);
-  }, []);
+  const selectQueueIndex = useCallback(
+    (index: number) => {
+      unlockAudioSync();
+      userWantsPlayingRef.current = true;
+      recoveryAttemptsRef.current = 0;
+      setCurrentIndex(index);
+    },
+    [unlockAudioSync]
+  );
 
   const setSleepTimerMinutes = useCallback(
     (minutes: number | 'end-of-track' | null) => {
@@ -1214,6 +2273,7 @@ export function useMediaEngine({
   }, []);
 
   return {
+    audioRef,
     videoRef,
     ytContainerRef,
     queue,
@@ -1222,6 +2282,7 @@ export function useMediaEngine({
     playMode,
     activeEngine,
     streamSourceLabel,
+    isRetryingNative,
     isPiPSupported,
     isPlaying,
     isLoading,
@@ -1252,6 +2313,7 @@ export function useMediaEngine({
     seekTo,
     skipBy,
     switchPlayMode,
+    retryNativeStream,
     togglePictureInPicture,
     setSleepTimerMinutes,
   };

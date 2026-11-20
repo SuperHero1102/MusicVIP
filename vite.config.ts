@@ -12,11 +12,11 @@ export default defineConfig(() => {
       tailwindcss(),
       VitePWA({
         registerType: 'autoUpdate',
-        includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
+        includeAssets: ['favicon.ico', 'favicon-32x32.png', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
         manifest: {
           id: '/',
-          name: 'PureStream — Nghe YouTube Không Quảng Cáo',
-          short_name: 'PureStream',
+          name: 'Music Tube — Nghe YouTube Không Quảng Cáo',
+          short_name: 'Music Tube',
           description: 'Trình phát YouTube tối giản không quảng cáo, phát âm thanh nền khi tắt màn hình và tự động bỏ qua đoạn tài trợ.',
           theme_color: '#0B0D10',
           background_color: '#0B0D10',
@@ -46,6 +46,9 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
+          skipWaiting: true,
+          clientsClaim: true,
+          cleanupOutdatedCaches: true,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
           navigateFallbackDenylist: [/^\/api\//],
           runtimeCaching: [
@@ -80,7 +83,7 @@ export default defineConfig(() => {
           ],
         },
         devOptions: {
-          enabled: true,
+          enabled: false,
           type: 'module',
         },
       }),

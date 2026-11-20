@@ -27,7 +27,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
   const pct = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
 
   return (
-    <div className="lg:hidden fixed left-3 right-3 bottom-[68px] z-30 overflow-hidden rounded-2xl border border-slate-200/90 dark:border-white/10 bg-white/95 dark:bg-[#14171D]/95 backdrop-blur-md shadow-xl shadow-black/20">
+    <div className="mx-3 mb-2.5 overflow-hidden rounded-2xl border border-slate-200/90 dark:border-white/10 bg-white/95 dark:bg-[#14171D]/95 backdrop-blur-md shadow-xl shadow-black/20">
       {/* Slim progress hairline */}
       <div className="h-[2px] w-full bg-slate-200 dark:bg-white/10">
         <div

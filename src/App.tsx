@@ -135,6 +135,9 @@ export default function App() {
         const looksLikeUrl = /youtu(\.be|be\.com)/i.test(q);
         if (looksLikeUrl && results.length === 1) {
           engine.playTrack(results[0], results);
+          if (engine.playMode === 'video') {
+            setMobilePlayerOpen(true);
+          }
           showToast('Đã nhận diện liên kết YouTube — đang phát không quảng cáo.');
         }
       } catch (err) {
@@ -173,6 +176,9 @@ export default function App() {
   const handleSelectTrack = useCallback(
     (track: TrackItem, list?: TrackItem[]) => {
       engine.playTrack(track, list);
+      if (engine.playMode === 'video') {
+        setMobilePlayerOpen(true);
+      }
     },
     [engine]
   );
@@ -185,7 +191,7 @@ export default function App() {
   ];
 
   return (
-    <div className="flex min-h-screen w-full bg-[#F8F9FB] text-slate-900 dark:bg-[#0B0D10] dark:text-slate-100">
+    <div className="relative z-[1] flex min-h-screen w-full bg-[#F8F9FB] text-slate-900 dark:bg-[#0B0D10] dark:text-slate-100">
       <OfflineIndicator />
 
       {/* Desktop Left Navigation Rail */}
@@ -197,9 +203,11 @@ export default function App() {
             onClick={() => setActiveTab('discover')}
             className="flex items-center gap-2.5 px-2.5 py-1 text-left whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#F43F5E] rounded-lg"
           >
-            <img src="/icon.svg" alt="" className="h-7 w-7 rounded-lg" />
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-black ring-1 ring-black/10 dark:ring-white/15 shadow-sm">
+              <img src="/pwa-192x192.png" alt="Music Tube" className="h-full w-full object-contain" />
+            </div>
             <span className="text-lg font-bold tracking-tight text-slate-900 dark:text-white">
-              PureStream
+              Music Tube
             </span>
           </button>
 
@@ -267,11 +275,13 @@ export default function App() {
           <button
             type="button"
             onClick={() => setActiveTab('discover')}
-            className="flex items-center gap-2 whitespace-nowrap shrink-0"
+            className="flex items-center gap-2.5 whitespace-nowrap shrink-0"
           >
-            <img src="/icon.svg" alt="" className="h-6 w-6 rounded-md" />
+            <div className="flex h-7 w-7 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-black ring-1 ring-black/10 dark:ring-white/15 shadow-sm">
+              <img src="/pwa-192x192.png" alt="Music Tube" className="h-full w-full object-contain" />
+            </div>
             <span className="text-base font-bold tracking-tight text-slate-900 dark:text-white">
-              PureStream
+              Music Tube
             </span>
           </button>
 
@@ -293,7 +303,11 @@ export default function App() {
         </header>
 
         {/* Main Scrollable Workspace */}
-        <main className="mx-auto w-full max-w-4xl flex-1 px-4 sm:px-6 lg:px-8 py-5 pb-40 lg:pb-10">
+        <main
+          className={`mx-auto w-full max-w-4xl flex-1 px-4 sm:px-6 lg:px-8 py-5 ${
+            engine.currentTrack ? 'main-pb-miniplayer' : 'main-pb-nav'
+          } lg:pb-10`}
+        >
           {/* Persistent Search Input for Discover & Search Tabs */}
           {(activeTab === 'discover' || activeTab === 'search') && (
             <form onSubmit={handleSearchSubmit} className="mb-6">
@@ -564,11 +578,15 @@ export default function App() {
               onToggleSponsorCategory={library.toggleSponsorCategory}
             />
           )}
+
+          <footer className="mt-10 border-t border-slate-200/70 dark:border-white/[0.06] pt-6 text-center text-xs text-slate-400 dark:text-slate-500">
+            © Bản quyền thuộc Hải An Group
+          </footer>
         </main>
       </div>
 
       {/* Desktop Persistent Right Player & Queue Panel */}
-      <aside className="hidden lg:flex lg:w-[380px] xl:w-[420px] shrink-0 flex-col border-l border-slate-200 dark:border-white/[0.07] sticky top-0 h-screen">
+      <aside className="hidden lg:flex lg:w-[380px] xl:w-[420px] shrink-0 flex-col border-l border-slate-200 dark:border-white/[0.07] bg-white dark:bg-[#0F1217] sticky top-0 z-10 h-screen">
         <PlayerPanel
           currentTrack={engine.currentTrack}
           queue={engine.queue}
@@ -576,6 +594,7 @@ export default function App() {
           playMode={engine.playMode}
           activeEngine={engine.activeEngine}
           streamSourceLabel={engine.streamSourceLabel}
+          isRetryingNative={engine.isRetryingNative}
           isPiPSupported={engine.isPiPSupported}
           isPlaying={engine.isPlaying}
           isLoading={engine.isLoading}
@@ -599,6 +618,15 @@ export default function App() {
           onSeek={engine.seekTo}
           onSkipBy={engine.skipBy}
           onSwitchPlayMode={engine.switchPlayMode}
+          onRetryNativeStream={() => {
+            void engine.retryNativeStream().then((ok) => {
+              showToast(
+                ok
+                  ? 'Đã chuyển sang luồng gốc — hỗ trợ tắt màn hình.'
+                  : 'Chưa lấy được luồng gốc từ máy chủ hoặc mạng hiện tại.'
+              );
+            });
+          }}
           onTogglePiP={() => void engine.togglePictureInPicture()}
           onVolumeChange={(v) => {
             engine.setVolume(v);
@@ -616,20 +644,6 @@ export default function App() {
         />
       </aside>
 
-      {/* Mobile Floating Mini-Player */}
-      {engine.currentTrack && !mobilePlayerOpen && (
-        <MiniPlayer
-          track={engine.currentTrack}
-          isPlaying={engine.isPlaying}
-          isLoading={engine.isLoading}
-          currentTime={engine.currentTime}
-          duration={engine.duration}
-          onExpand={() => setMobilePlayerOpen(true)}
-          onTogglePlay={engine.togglePlay}
-          onNext={engine.playNext}
-        />
-      )}
-
       {/* Mobile Full-Screen Player Sheet */}
       {mobilePlayerOpen && engine.currentTrack && (
         <div className="lg:hidden fixed inset-0 z-40 flex flex-col bg-white dark:bg-[#0F1217]">
@@ -643,6 +657,7 @@ export default function App() {
             playMode={engine.playMode}
             activeEngine={engine.activeEngine}
             streamSourceLabel={engine.streamSourceLabel}
+            isRetryingNative={engine.isRetryingNative}
             isPiPSupported={engine.isPiPSupported}
             isPlaying={engine.isPlaying}
             isLoading={engine.isLoading}
@@ -665,6 +680,15 @@ export default function App() {
             onSeek={engine.seekTo}
             onSkipBy={engine.skipBy}
             onSwitchPlayMode={engine.switchPlayMode}
+            onRetryNativeStream={() => {
+              void engine.retryNativeStream().then((ok) => {
+                showToast(
+                  ok
+                    ? 'Đã chuyển sang luồng gốc — hỗ trợ tắt màn hình.'
+                    : 'Chưa lấy được luồng gốc từ máy chủ hoặc mạng hiện tại.'
+                );
+              });
+            }}
             onTogglePiP={() => void engine.togglePictureInPicture()}
             onVolumeChange={engine.setVolume}
             onToggleMute={() => engine.setIsMuted((m) => !m)}
@@ -680,6 +704,14 @@ export default function App() {
         </div>
       )}
 
+      {/* Persistent DOM-Mounted Native <audio> Element (always rendered, never display:none/opacity-0 for iOS lock-screen playback) */}
+      <audio
+        ref={engine.audioRef}
+        playsInline
+        preload="auto"
+        className="fixed left-0 top-0 z-0 h-1 w-1 pointer-events-none"
+      />
+
       {/* Persistent Native Ad-Free HTML5 <video> Viewport (supports PiP & lock-screen audio handoff) */}
       <video
         ref={engine.videoRef}
@@ -690,7 +722,7 @@ export default function App() {
         className={
           activeVideoRect && engine.playMode === 'video' && engine.activeEngine === 'native-video'
             ? 'fixed z-[45] overflow-hidden rounded-2xl bg-black object-contain cursor-pointer'
-            : 'fixed -left-[9999px] top-0 h-[180px] w-[320px] opacity-0 pointer-events-none'
+            : 'fixed left-0 top-0 z-0 h-1 w-1 pointer-events-none'
         }
         style={
           activeVideoRect && engine.playMode === 'video' && engine.activeEngine === 'native-video'
@@ -704,17 +736,19 @@ export default function App() {
         }
       />
 
-      {/* Persistent Fallback YouTube Privacy Player Host */}
+      {/* Persistent Fallback YouTube Privacy Player Host (always rendered with real dimensions, never display:none/opacity-0) */}
       <div
         ref={engine.ytContainerRef}
         aria-hidden={!(activeVideoRect && engine.playMode === 'video' && engine.activeEngine === 'yt-privacy')}
         className={
           activeVideoRect && engine.playMode === 'video' && engine.activeEngine === 'yt-privacy'
             ? 'fixed z-[45] overflow-hidden rounded-2xl bg-black'
-            : 'fixed -left-[9999px] top-0 h-[180px] w-[320px] opacity-0 pointer-events-none'
+            : activeVideoRect && engine.playMode === 'audio' && engine.activeEngine === 'yt-privacy'
+            ? 'fixed z-0 overflow-hidden rounded-2xl bg-black pointer-events-none'
+            : 'fixed left-0 top-0 z-0 h-4 w-4 overflow-hidden pointer-events-none'
         }
         style={
-          activeVideoRect && engine.playMode === 'video' && engine.activeEngine === 'yt-privacy'
+          activeVideoRect && engine.activeEngine === 'yt-privacy'
             ? {
                 left: activeVideoRect.left,
                 top: activeVideoRect.top,
@@ -725,35 +759,52 @@ export default function App() {
         }
       />
 
-      {/* Mobile Fixed Bottom Tab Bar (Thumb Zone) */}
-      <nav
-        aria-label="Điều hướng di động"
-        className="lg:hidden fixed bottom-0 left-0 right-0 z-30 border-t border-slate-200/90 dark:border-white/[0.08] bg-white/95 dark:bg-[#0E1116]/95 backdrop-blur-md pb-safe"
-      >
-        <div className="grid h-15 grid-cols-4 items-center">
-          {navItems.map((item) => {
-            const Icon = item.icon;
-            const active = activeTab === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => setActiveTab(item.id)}
-                className={`flex h-full flex-col items-center justify-center gap-1 transition-colors ${
-                  active
-                    ? 'text-[#E11D48] dark:text-[#F43F5E]'
-                    : 'text-slate-500 dark:text-slate-400'
-                }`}
-              >
-                <Icon className="h-5 w-5" />
-                <span className="text-[10px] font-medium tracking-tight leading-none">
-                  {item.label}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      </nav>
+      {/* Unified Mobile Bottom Stack: Mini-Player directly above Navigation Bar (Thumb Zone) */}
+      <div className="lg:hidden fixed bottom-0 left-0 right-0 z-30 flex flex-col pointer-events-none">
+        {engine.currentTrack && !mobilePlayerOpen && (
+          <div className="pointer-events-auto">
+            <MiniPlayer
+              track={engine.currentTrack}
+              isPlaying={engine.isPlaying}
+              isLoading={engine.isLoading}
+              currentTime={engine.currentTime}
+              duration={engine.duration}
+              onExpand={() => setMobilePlayerOpen(true)}
+              onTogglePlay={engine.togglePlay}
+              onNext={engine.playNext}
+            />
+          </div>
+        )}
+
+        <nav
+          aria-label="Điều hướng di động"
+          className="pointer-events-auto border-t border-slate-200/90 dark:border-white/[0.08] bg-white/95 dark:bg-[#0E1116]/95 backdrop-blur-md pb-safe"
+        >
+          <div className="grid h-15 grid-cols-4 items-center">
+            {navItems.map((item) => {
+              const Icon = item.icon;
+              const active = activeTab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setActiveTab(item.id)}
+                  className={`flex h-full flex-col items-center justify-center gap-1 transition-colors ${
+                    active
+                      ? 'text-[#E11D48] dark:text-[#F43F5E]'
+                      : 'text-slate-500 dark:text-slate-400'
+                  }`}
+                >
+                  <Icon className="h-5 w-5" />
+                  <span className="text-[10px] font-medium tracking-tight leading-none">
+                    {item.label}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </nav>
+      </div>
 
       {/* Add-to-Playlist Modal */}
       <PlaylistModal

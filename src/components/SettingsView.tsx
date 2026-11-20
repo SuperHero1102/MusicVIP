@@ -138,7 +138,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               Nghe nền khi tắt màn hình trên mọi thiết bị
             </h2>
             <p className="mt-1 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
-              PureStream phát luồng âm thanh gốc kết hợp chuẩn Media Session API. Khi ở chế độ <strong>Âm thanh</strong>, bạn có thể khóa màn hình hoặc chuyển sang ứng dụng khác mà nhạc vẫn chạy liên tục cùng nút điều khiển trên màn hình khóa.
+              Music Tube phát luồng âm thanh gốc kết hợp chuẩn Media Session API. Khi ở chế độ <strong>Âm thanh</strong>, bạn có thể khóa màn hình hoặc chuyển sang ứng dụng khác mà nhạc vẫn chạy liên tục cùng nút điều khiển trên màn hình khóa.
             </p>
             <div className="mt-3 flex flex-wrap items-center gap-3">
               <PWAInstallButton />
