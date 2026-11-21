@@ -60,10 +60,99 @@ interface CacheEntry<T> {
 
 const searchCache = new Map<string, CacheEntry<TrackDTO[]>>();
 const mediaBundleCache = new Map<string, CachedMediaBundle>();
+const inflightBundles = new Map<string, Promise<CachedMediaBundle>>();
 const sponsorCache = new Map<
   string,
   CacheEntry<Array<{ uuid: string; category: string; start: number; end: number }>>
 >();
+
+interface BufferedMediaEntry {
+  buffer: Buffer;
+  mimeType: string;
+  lastAccessed: number;
+}
+const MAX_BUFFERED_TRACK_BYTES = 40 * 1024 * 1024;
+const MAX_TOTAL_BUFFERED_BYTES = 100 * 1024 * 1024;
+const mediaDataCache = new Map<string, BufferedMediaEntry>();
+const mediaWarmingPromises = new Map<string, Promise<void>>();
+
+function evictMediaDataCacheIfNeeded(incomingBytes: number): void {
+  let total = incomingBytes;
+  for (const entry of mediaDataCache.values()) {
+    total += entry.buffer.byteLength;
+  }
+  if (total <= MAX_TOTAL_BUFFERED_BYTES) return;
+  const sorted = Array.from(mediaDataCache.entries()).sort(
+    (a, b) => a[1].lastAccessed - b[1].lastAccessed
+  );
+  for (const [key, entry] of sorted) {
+    if (total <= MAX_TOTAL_BUFFERED_BYTES) break;
+    mediaDataCache.delete(key);
+    total -= entry.buffer.byteLength;
+  }
+}
+
+function warmFullMediaBuffer(
+  cacheKey: string,
+  descriptor: StreamDescriptor
+): void {
+  if (mediaDataCache.has(cacheKey) || mediaWarmingPromises.has(cacheKey)) return;
+  if (descriptor.contentLength && descriptor.contentLength > MAX_BUFFERED_TRACK_BYTES) return;
+
+  const task = (async () => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 30_000);
+    try {
+      let resp = await fetch(descriptor.url, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1',
+        },
+        signal: ctrl.signal,
+      });
+      if (resp.status === 403) {
+        resp = await fetch(descriptor.url, { signal: ctrl.signal });
+      }
+      if (!resp.ok || !resp.body) return;
+      const declaredLen = Number(resp.headers.get('content-length') || '0');
+      if (declaredLen > MAX_BUFFERED_TRACK_BYTES) {
+        void resp.body.cancel().catch(() => {});
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      const reader = resp.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        totalBytes += value.byteLength;
+        if (totalBytes > MAX_BUFFERED_TRACK_BYTES) {
+          void reader.cancel().catch(() => {});
+          return;
+        }
+        chunks.push(Buffer.from(value));
+      }
+      if (totalBytes === 0) return;
+
+      const fullBuffer = Buffer.concat(chunks, totalBytes);
+      evictMediaDataCacheIfNeeded(fullBuffer.byteLength);
+      mediaDataCache.set(cacheKey, {
+        buffer: fullBuffer,
+        mimeType: resp.headers.get('content-type') || descriptor.mimeType || 'audio/mp4',
+        lastAccessed: Date.now(),
+      });
+    } catch {
+      // Background warm-up failure is harmless; Range proxy handles live requests
+    } finally {
+      clearTimeout(timer);
+      mediaWarmingPromises.delete(cacheKey);
+    }
+  })();
+
+  mediaWarmingPromises.set(cacheKey, task);
+}
 
 const WEBPO_REQUEST_KEY = 'O43z0dpjhgX20SCx4KAo';
 
@@ -407,13 +496,19 @@ async function extractFromClients(
 
   const settled = await Promise.allSettled(
     clients.map(async (client) => {
-      const info = await yt.getBasicInfo(videoId, {
-        client,
-        ...(poToken ? { po_token: poToken } : {}),
-      });
+      const info = await Promise.race([
+        yt.getBasicInfo(videoId, {
+          client,
+          ...(poToken ? { po_token: poToken } : {}),
+        }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 2600)),
+      ]);
       return { client, info };
     })
   );
+
+  const audioCandidates: Array<{ urlPromise: Promise<string | null>; mime: string; contentLength?: number; client: string }> = [];
+  const videoCandidates: Array<{ urlPromise: Promise<string | null>; mime: string; quality: string; contentLength?: number; client: string }> = [];
 
   for (const res of settled) {
     if (res.status !== 'fulfilled') continue;
@@ -423,8 +518,8 @@ async function extractFromClients(
       botCheckBlocked = true;
     }
 
-    if (!audio) {
-      const adaptiveCandidates = (info.streaming_data?.adaptive_formats || [])
+    if (audioCandidates.length < 3) {
+      const adaptive = (info.streaming_data?.adaptive_formats || [])
         .filter((f) => f.has_audio && !f.has_video && (f.url || f.signature_cipher || f.cipher))
         .sort((a, b) => {
           const aMp4 = a.mime_type?.includes('audio/mp4') ? 1 : 0;
@@ -433,25 +528,20 @@ async function extractFromClients(
           return (b.bitrate || 0) - (a.bitrate || 0);
         });
 
-      for (const candidate of adaptiveCandidates.slice(0, 2)) {
+      for (const candidate of adaptive.slice(0, 2)) {
         const mime = (candidate.mime_type || '').split(';')[0];
-        // Prefer AAC/MP4 audio for universal iOS Safari background compatibility
         if (!mime.includes('mp4')) continue;
-        const url = await resolveFormatUrl(candidate, yt);
-        if (url && (await verifyStreamUrl(url))) {
-          audio = {
-            url,
-            mimeType: mime || 'audio/mp4',
-            contentLength: candidate.content_length ? Number(candidate.content_length) : undefined,
-            source: `youtubei-${client.toLowerCase()}`,
-          };
-          break;
-        }
+        audioCandidates.push({
+          urlPromise: resolveFormatUrl(candidate, yt),
+          mime: mime || 'audio/mp4',
+          contentLength: candidate.content_length ? Number(candidate.content_length) : undefined,
+          client: client.toLowerCase(),
+        });
       }
     }
 
-    if (!video) {
-      const muxedCandidates = (info.streaming_data?.formats || [])
+    if (videoCandidates.length < 3) {
+      const muxed = (info.streaming_data?.formats || [])
         .filter((f) => f.has_video && f.has_audio && (f.url || f.signature_cipher || f.cipher))
         .sort((a, b) => {
           const aMp4 = a.mime_type?.includes('video/mp4') ? 1 : 0;
@@ -460,21 +550,52 @@ async function extractFromClients(
           return (b.height || 0) - (a.height || 0);
         });
 
-      for (const candidate of muxedCandidates.slice(0, 2)) {
-        const url = await resolveFormatUrl(candidate, yt);
-        if (url && (await verifyStreamUrl(url))) {
-          video = {
-            url,
-            mimeType: (candidate.mime_type || 'video/mp4').split(';')[0],
-            quality: candidate.quality_label || `${candidate.height || 360}p`,
-            contentLength: candidate.content_length ? Number(candidate.content_length) : undefined,
-            source: `youtubei-${client.toLowerCase()}`,
-          };
-          break;
-        }
+      for (const candidate of muxed.slice(0, 2)) {
+        videoCandidates.push({
+          urlPromise: resolveFormatUrl(candidate, yt),
+          mime: (candidate.mime_type || 'video/mp4').split(';')[0],
+          quality: candidate.quality_label || `${candidate.height || 360}p`,
+          contentLength: candidate.content_length ? Number(candidate.content_length) : undefined,
+          client: client.toLowerCase(),
+        });
       }
     }
   }
+
+  const [verifiedAudioList, verifiedVideoList] = await Promise.all([
+    Promise.all(
+      audioCandidates.slice(0, 3).map(async (c) => {
+        const url = await c.urlPromise;
+        if (url && (await verifyStreamUrl(url))) {
+          return {
+            url,
+            mimeType: c.mime,
+            contentLength: c.contentLength,
+            source: `youtubei-${c.client}`,
+          } satisfies StreamDescriptor;
+        }
+        return null;
+      })
+    ),
+    Promise.all(
+      videoCandidates.slice(0, 3).map(async (c) => {
+        const url = await c.urlPromise;
+        if (url && (await verifyStreamUrl(url))) {
+          return {
+            url,
+            mimeType: c.mime,
+            quality: c.quality,
+            contentLength: c.contentLength,
+            source: `youtubei-${c.client}`,
+          } satisfies StreamDescriptor;
+        }
+        return null;
+      })
+    ),
+  ]);
+
+  audio = verifiedAudioList.find(Boolean) || null;
+  video = verifiedVideoList.find(Boolean) || null;
 
   return { audio, video, botCheckBlocked };
 }
@@ -496,52 +617,61 @@ async function resolveMediaBundle(
     return cached;
   }
 
-  let audio: StreamDescriptor | null = null;
-  let video: StreamDescriptor | null = null;
-  let botCheckBlocked = false;
-
-  try {
-    const [yt, poToken] = await Promise.all([getInnertube(), mintVideoPoToken(videoId)]);
-
-    const batch1 = await extractFromClients(
-      yt,
-      videoId,
-      ['IOS', 'ANDROID', 'ANDROID_VR', 'TV'],
-      poToken
-    );
-    audio = batch1.audio;
-    video = batch1.video;
-    botCheckBlocked = batch1.botCheckBlocked;
-
-    // If primary mobile/TV clients didn't yield both audio and video, try web/mweb/embedded with deciphering + PoToken
-    if (!audio || !video) {
-      const batch2 = await extractFromClients(
-        yt,
-        videoId,
-        ['MWEB', 'WEB', 'WEB_EMBEDDED', 'WEB_CREATOR'],
-        poToken
-      );
-      if (!audio && batch2.audio) audio = batch2.audio;
-      if (!video && batch2.video) video = batch2.video;
-      botCheckBlocked = botCheckBlocked || batch2.botCheckBlocked;
-    }
-
-    // Muxed MP4 also plays reliably inside iOS native <audio> when adaptive M4A is absent
-    if (!audio && video) {
-      audio = { ...video, source: `${video.source}-muxed` };
-    }
-  } catch (err) {
-    console.warn('[media] Innertube resolution error:', (err as Error).message);
+  if (!forceFresh) {
+    const inflight = inflightBundles.get(videoId);
+    if (inflight) return inflight;
   }
 
-  const bundle: CachedMediaBundle = {
-    audio,
-    video,
-    botCheckBlocked: !audio && !video && botCheckBlocked,
-    expiresAt: Date.now() + (audio || video ? 25 * 60_000 : 15_000),
-  };
-  mediaBundleCache.set(videoId, bundle);
-  return bundle;
+  const task = (async (): Promise<CachedMediaBundle> => {
+    let audio: StreamDescriptor | null = null;
+    let video: StreamDescriptor | null = null;
+    let botCheckBlocked = false;
+
+    try {
+      const [yt, poToken] = await Promise.all([getInnertube(), mintVideoPoToken(videoId)]);
+
+      const extracted = await extractFromClients(
+        yt,
+        videoId,
+        ['IOS', 'ANDROID', 'ANDROID_VR', 'TV', 'MWEB', 'WEB', 'WEB_CREATOR'],
+        poToken
+      );
+      audio = extracted.audio;
+      video = extracted.video;
+      botCheckBlocked = extracted.botCheckBlocked;
+
+      // Muxed MP4 also plays reliably inside iOS native <audio> when adaptive M4A is absent
+      if (!audio && video) {
+        audio = { ...video, source: `${video.source}-muxed` };
+      }
+    } catch (err) {
+      console.warn('[media] Innertube resolution error:', (err as Error).message);
+    }
+
+    const bundle: CachedMediaBundle = {
+      audio,
+      video,
+      botCheckBlocked: !audio && !video && botCheckBlocked,
+      expiresAt: Date.now() + (audio || video ? 25 * 60_000 : 45_000),
+    };
+    mediaBundleCache.set(videoId, bundle);
+
+    if (audio) {
+      warmFullMediaBuffer(`audio:${videoId}`, audio);
+    }
+    return bundle;
+  })();
+
+  if (!forceFresh) {
+    inflightBundles.set(videoId, task);
+  }
+  try {
+    return await task;
+  } finally {
+    if (inflightBundles.get(videoId) === task) {
+      inflightBundles.delete(videoId);
+    }
+  }
 }
 
 async function proxyRangeMedia(
@@ -561,6 +691,44 @@ async function proxyRangeMedia(
     return;
   }
 
+  const isHead = req.method === 'HEAD';
+  const cacheKey = `${kind}:${videoId}`;
+  const memEntry = mediaDataCache.get(cacheKey);
+  if (memEntry) {
+    memEntry.lastAccessed = Date.now();
+    const totalLen = memEntry.buffer.byteLength;
+    res.setHeader('Content-Type', memEntry.mimeType);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'private, max-age=1800');
+
+    const rangeHeader = req.headers.range;
+    if (rangeHeader) {
+      const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+      if (match) {
+        const start = match[1] ? parseInt(match[1], 10) : 0;
+        const end = match[2] ? Math.min(parseInt(match[2], 10), totalLen - 1) : totalLen - 1;
+        if (start >= 0 && start <= end && start < totalLen) {
+          const slice = memEntry.buffer.subarray(start, end + 1);
+          res.status(206);
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${totalLen}`);
+          res.setHeader('Content-Length', String(slice.byteLength));
+          if (isHead) res.end();
+          else res.end(slice);
+          return;
+        }
+      }
+    }
+
+    res.status(200);
+    res.setHeader('Content-Length', String(totalLen));
+    if (isHead) res.end();
+    else res.end(memEntry.buffer);
+    return;
+  }
+
+  // Trigger background full-file warm-up so subsequent ranges & screen-off playback read from RAM in <1ms
+  warmFullMediaBuffer(cacheKey, descriptor);
+
   const forwardHeaders: Record<string, string> = {
     'User-Agent':
       'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1',
@@ -569,7 +737,6 @@ async function proxyRangeMedia(
     forwardHeaders.Range = req.headers.range;
   }
 
-  const isHead = req.method === 'HEAD';
   // googlevideo signed URLs reject HTTP HEAD with 403; probe 1 byte via GET for HEAD requests
   if (isHead && !forwardHeaders.Range) {
     forwardHeaders.Range = 'bytes=0-0';
@@ -613,7 +780,7 @@ async function proxyRangeMedia(
         (kind === 'audio' ? 'audio/mp4' : 'video/mp4')
     );
     res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Cache-Control', 'private, max-age=1800');
 
     if (isHead && !req.headers.range && contentRange) {
       const totalMatch = contentRange.match(/\/(\d+)$/);

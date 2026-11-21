@@ -844,7 +844,7 @@ export default function App() {
       )}
 
       {/* Auto Edge-to-Edge Fullscreen Video Stage (instant 0ms on track select in Video mode) */}
-      {isVideoFullscreenActive && engine.currentTrack && (
+      {isVideoFullscreenActive && currentTrack && (
         <div
           className="fixed inset-0 z-[48] bg-black"
           role="dialog"
@@ -853,11 +853,11 @@ export default function App() {
         >
           <div ref={fullscreenSlotRef} className="h-full w-full" />
           {(engine.isLoading ||
-            (engine.activeEngine !== 'native-video' && engine.activeEngine !== 'yt-privacy')) && (
+            (activeEngine !== 'native-video' && activeEngine !== 'yt-privacy')) && (
             <div className="pointer-events-none fixed inset-0 z-[50] flex items-center justify-center bg-black">
               <img
-                src={engine.currentTrack.thumbnail}
-                alt={engine.currentTrack.title}
+                src={currentTrack.thumbnail}
+                alt={currentTrack.title}
                 referrerPolicy="no-referrer"
                 className="max-h-full max-w-full object-contain opacity-35"
               />
@@ -866,15 +866,6 @@ export default function App() {
               </div>
             </div>
           )}
-          <button
-            type="button"
-            onClick={handleExitVideoFullscreen}
-            aria-label="Thu gọn video toàn màn hình"
-            style={{ top: 'calc(env(safe-area-inset-top, 0px) + 12px)' }}
-            className="fixed left-4 z-[60] flex h-11 w-11 items-center justify-center rounded-full bg-black/65 text-white ring-1 ring-white/25 backdrop-blur-md hover:bg-black/85 active:scale-95 transition-all"
-          >
-            <Minimize2 className="h-5 w-5" />
-          </button>
         </div>
       )}
 
@@ -937,6 +928,23 @@ export default function App() {
             : undefined
         }
       />
+
+      {/* Root-level Minimize button above both z-[55] native <video> and YouTube <iframe> */}
+      {isVideoFullscreenActive && currentTrack && (
+        <button
+          type="button"
+          onClick={handleExitVideoFullscreen}
+          aria-label="Thu gọn video toàn màn hình"
+          title="Thu nhỏ"
+          style={{
+            top: 'calc(env(safe-area-inset-top, 0px) + 14px)',
+            left: 'calc(env(safe-area-inset-left, 0px) + 14px)',
+          }}
+          className="fixed z-[70] pointer-events-auto flex h-11 w-11 items-center justify-center rounded-full bg-black/70 text-white ring-1 ring-white/30 shadow-lg backdrop-blur-md hover:bg-black/90 active:scale-95 transition-all"
+        >
+          <Minimize2 className="h-5 w-5" />
+        </button>
+      )}
 
       {/* Unified Mobile Bottom Stack: Mini-Player directly above Navigation Bar (Thumb Zone) */}
       <div className="lg:hidden fixed bottom-0 left-0 right-0 z-30 flex flex-col pointer-events-none">

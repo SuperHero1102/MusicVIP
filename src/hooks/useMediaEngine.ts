@@ -93,6 +93,8 @@ function appendCacheBusterIfLocal(url: string | null): string | null {
 const PIPED_HOSTS = [
   'https://pipedapi.ducks.party',
   'https://api.piped.private.coffee',
+  'https://pipedapi.adminforge.de',
+  'https://api.piped.yt',
   'https://pipedapi.reallyaweso.me',
   'https://pipedapi.leptons.xyz',
   'https://pipedapi.kavin.rocks',
@@ -101,6 +103,7 @@ const PIPED_HOSTS = [
 const INVIDIOUS_FALLBACK_HOSTS = [
   'https://inv.nadeko.net',
   'https://invidious.nerdvpn.de',
+  'https://invidious.tiekoetter.com',
 ];
 
 const PLAY_MODE_STORAGE_KEY = 'musictube_play_mode';
@@ -131,84 +134,83 @@ function recordHealthyHost(kind: 'piped' | 'invidious', host: string): void {
   }
 }
 
-let cachedPipedHosts: string[] | null = null;
-let pipedDiscoveryPromise: Promise<string[]> | null = null;
+let discoveredPipedHosts: string[] = [];
+let discoveredInvidiousHosts: string[] = [];
+let directoryWarmStarted = false;
 
-async function getPipedHosts(forceRefresh = false): Promise<string[]> {
-  if (cachedPipedHosts && !forceRefresh) return cachedPipedHosts;
-  if (pipedDiscoveryPromise) return pipedDiscoveryPromise;
+/**
+ * Refreshes public Piped/Invidious host directory purely in the background
+ * without ever blocking track playback or stream resolution.
+ */
+function warmTier2HostDirectory(): void {
+  if (directoryWarmStarted || typeof window === 'undefined') return;
+  directoryWarmStarted = true;
 
-  const saved = getSavedHealthyHosts().piped;
-  pipedDiscoveryPromise = (async () => {
+  void (async () => {
     const ctrl = new AbortController();
     const timer = window.setTimeout(() => ctrl.abort(), 3000);
     try {
-      const resp = await fetch('https://piped-instances.kavin.rocks/', {
-        signal: ctrl.signal,
-      });
-      if (!resp.ok) throw new Error('piped-list-failed');
-      const entries = (await resp.json()) as Array<{
-        api_url?: string;
-        up_to_date?: boolean;
-        uptime_24h?: number;
-      }>;
-      const discovered = (entries || [])
-        .filter((e) => e?.api_url?.startsWith('https://') && (e.uptime_24h ?? 100) >= 80)
-        .slice(0, 8)
-        .map((e) => e.api_url!.replace(/\/$/, ''));
-      const merged = Array.from(new Set([...saved, ...discovered, ...PIPED_HOSTS]));
-      cachedPipedHosts = merged;
-      return merged;
+      const [pResp, iResp] = await Promise.allSettled([
+        fetch(
+          'https://raw.githubusercontent.com/TeamPiped/documentation/main/content/docs/public-instances/index.md',
+          { signal: ctrl.signal }
+        ),
+        fetch(
+          'https://raw.githubusercontent.com/iv-org/documentation/master/docs/instances.md',
+          { signal: ctrl.signal }
+        ),
+      ]);
+
+      if (pResp.status === 'fulfilled' && pResp.value.ok) {
+        const text = await pResp.value.text();
+        const matches = text.match(/https:\/\/[a-z0-9.-]+/gi) || [];
+        discoveredPipedHosts = Array.from(
+          new Set(
+            matches.filter(
+              (u) =>
+                !u.includes('github') &&
+                !u.includes('piped.video') &&
+                !u.includes('duckduckgo') &&
+                (u.includes('api') || u.includes('pa.') || u.includes('pdapi'))
+            )
+          )
+        ).slice(0, 10);
+      }
+
+      if (iResp.status === 'fulfilled' && iResp.value.ok) {
+        const text = await iResp.value.text();
+        const matches = text.match(/https:\/\/[a-z0-9.-]+/gi) || [];
+        discoveredInvidiousHosts = Array.from(
+          new Set(
+            matches.filter(
+              (u) =>
+                !u.includes('github') &&
+                !u.includes('invidious.io') &&
+                !u.includes('updown.io') &&
+                !u.includes('.onion') &&
+                !u.includes('.i2p')
+            )
+          )
+        ).slice(0, 8);
+      }
     } catch {
-      const fallback = Array.from(new Set([...saved, ...PIPED_HOSTS]));
-      cachedPipedHosts = fallback;
-      return fallback;
+      // Non-blocking background discovery
     } finally {
       window.clearTimeout(timer);
-      pipedDiscoveryPromise = null;
     }
   })();
-
-  return pipedDiscoveryPromise;
 }
 
-let cachedInvidiousHosts: string[] | null = null;
-let invidiousDiscoveryPromise: Promise<string[]> | null = null;
+function getImmediatePipedHosts(): string[] {
+  const saved = getSavedHealthyHosts().piped;
+  return Array.from(new Set([...saved, ...discoveredPipedHosts, ...PIPED_HOSTS])).slice(0, 10);
+}
 
-async function getInvidiousHosts(forceRefresh = false): Promise<string[]> {
-  if (cachedInvidiousHosts && !forceRefresh) return cachedInvidiousHosts;
-  if (invidiousDiscoveryPromise) return invidiousDiscoveryPromise;
-
+function getImmediateInvidiousHosts(): string[] {
   const saved = getSavedHealthyHosts().invidious;
-  invidiousDiscoveryPromise = (async () => {
-    const ctrl = new AbortController();
-    const timer = window.setTimeout(() => ctrl.abort(), 3000);
-    try {
-      const resp = await fetch('https://api.invidious.io/instances.json?sort_by=type,health', {
-        signal: ctrl.signal,
-      });
-      if (!resp.ok) throw new Error('invidious-list-failed');
-      const entries = (await resp.json()) as Array<
-        [string, { type?: string; cors?: boolean; api?: boolean; uri?: string }]
-      >;
-      const discovered = entries
-        .filter(([, meta]) => meta?.type === 'https' && meta?.cors === true && meta?.api === true && meta?.uri)
-        .slice(0, 8)
-        .map(([, meta]) => meta.uri!.replace(/\/$/, ''));
-      const merged = Array.from(new Set([...saved, ...discovered, ...INVIDIOUS_FALLBACK_HOSTS]));
-      cachedInvidiousHosts = merged;
-      return merged;
-    } catch {
-      const fallback = Array.from(new Set([...saved, ...INVIDIOUS_FALLBACK_HOSTS]));
-      cachedInvidiousHosts = fallback;
-      return fallback;
-    } finally {
-      window.clearTimeout(timer);
-      invidiousDiscoveryPromise = null;
-    }
-  })();
-
-  return invidiousDiscoveryPromise;
+  return Array.from(
+    new Set([...saved, ...discoveredInvidiousHosts, ...INVIDIOUS_FALLBACK_HOSTS])
+  ).slice(0, 6);
 }
 
 function isAppleTouchBrowser(): boolean {
@@ -220,25 +222,24 @@ function isAppleTouchBrowser(): boolean {
 }
 
 /**
- * Tier-2 residential-IP fallback: runs in the user's browser (residential/mobile IP)
- * when the cloud server IP is rate-limited by YouTube anti-bot checks.
+ * Tier-2 residential-IP fallback: runs immediately in parallel across candidate hosts
+ * with a tight 1.6s deadline so track switching never stalls on dead public endpoints.
  */
 async function probeClientDirectStreams(
-  videoId: string,
-  forceRefreshHosts = false
+  videoId: string
 ): Promise<{ audioUrl: string | null; videoUrl: string | null } | null> {
   const apple = isAppleTouchBrowser();
-  const [pipedHosts, invHosts] = await Promise.all([
-    getPipedHosts(forceRefreshHosts).catch(() => PIPED_HOSTS),
-    getInvidiousHosts(forceRefreshHosts).catch(() => INVIDIOUS_FALLBACK_HOSTS),
-  ]);
+  const pipedHosts = getImmediatePipedHosts();
+  const invHosts = getImmediateInvidiousHosts();
 
   const pipedProbes = pipedHosts.map(async (host) => {
     const ctrl = new AbortController();
-    const timer = window.setTimeout(() => ctrl.abort(), 3200);
+    const timer = window.setTimeout(() => ctrl.abort(), 1600);
     try {
       const r = await fetch(`${host}/streams/${videoId}`, { signal: ctrl.signal });
       if (!r.ok) throw new Error('status');
+      const ct = r.headers.get('content-type') || '';
+      if (ct && !ct.includes('json')) throw new Error('non-json');
       const data = (await r.json()) as {
         audioStreams?: Array<{ url?: string; mimeType?: string; bitrate?: number }>;
         videoStreams?: Array<{ url?: string; mimeType?: string; videoOnly?: boolean; quality?: string }>;
@@ -270,10 +271,12 @@ async function probeClientDirectStreams(
 
   const invidiousProbes = invHosts.map(async (host) => {
     const ctrl = new AbortController();
-    const timer = window.setTimeout(() => ctrl.abort(), 3400);
+    const timer = window.setTimeout(() => ctrl.abort(), 1600);
     try {
       const r = await fetch(`${host}/api/v1/videos/${videoId}`, { signal: ctrl.signal });
       if (!r.ok) throw new Error('status');
+      const ct = r.headers.get('content-type') || '';
+      if (ct && !ct.includes('json')) throw new Error('non-json');
       const data = (await r.json()) as {
         adaptiveFormats?: Array<{ url?: string; type?: string; bitrate?: string | number }>;
         formatStreams?: Array<{ url?: string; type?: string; qualityLabel?: string }>;
@@ -343,8 +346,12 @@ export function useMediaEngine({
   const streamCacheRef = useRef<
     Map<string, { resolved: ResolvedMediaUrls; expiresAt: number }>
   >(new Map());
+  const negativeResolveCacheRef = useRef<Map<string, number>>(new Map());
   const inflightResolveRef = useRef<Map<string, Promise<ResolvedMediaUrls>>>(new Map());
   const prefetchAttemptedRef = useRef<Map<string, number>>(new Map());
+  const lastTier1BlockedAtRef = useRef<number>(0);
+  const blobCacheRef = useRef<Map<string, { blobUrl: string; lastUsed: number }>>(new Map());
+  const blobInflightRef = useRef<Map<string, Promise<string | null>>>(new Map());
 
   const mediaUrlsRef = useRef<ResolvedMediaUrls>({
     audioUrl: null,
@@ -498,8 +505,11 @@ export function useMediaEngine({
     }
   }, []);
 
-  // Configure DOM-mounted <audio> element once for guaranteed background lock-screen playback
+  // Pre-warm YT Iframe API, Tier-2 host directory, and <audio> element on mount; revoke blob URLs on unmount
   useEffect(() => {
+    warmTier2HostDirectory();
+    void loadYouTubeIframeAPI();
+
     const audio = audioRef.current;
     if (audio) {
       audio.preload = 'auto';
@@ -514,6 +524,7 @@ export function useMediaEngine({
             .webkitSetPresentationMode === 'function')
     );
 
+    const blobMap = blobCacheRef.current;
     return () => {
       clearStallWatchdog();
       audioMetaCleanupRef.current?.();
@@ -527,6 +538,14 @@ export function useMediaEngine({
         void audioCtxRef.current.close().catch(() => {});
       }
       audioCtxRef.current = null;
+      for (const entry of blobMap.values()) {
+        try {
+          URL.revokeObjectURL(entry.blobUrl);
+        } catch {
+          // Ignore
+        }
+      }
+      blobMap.clear();
     };
   }, [clearStallWatchdog]);
 
@@ -555,12 +574,85 @@ export function useMediaEngine({
     return entry.resolved;
   }, []);
 
+  const getCachedBlobUrl = useCallback((cacheKey: string): string | null => {
+    const entry = blobCacheRef.current.get(cacheKey);
+    if (!entry) return null;
+    entry.lastUsed = Date.now();
+    return entry.blobUrl;
+  }, []);
+
+  /**
+   * Downloads the full audio/video stream in the background at maximum Wi-Fi / cellular speed
+   * into an in-memory Blob URL so locked-screen background playback never depends on live network chunks.
+   */
+  const preloadMediaBlob = useCallback(
+    (cacheKey: string, url: string | null, onReady?: (blobUrl: string) => void): void => {
+      if (!url || typeof window === 'undefined') return;
+      const existing = getCachedBlobUrl(cacheKey);
+      if (existing) {
+        onReady?.(existing);
+        return;
+      }
+      const inflight = blobInflightRef.current.get(cacheKey);
+      if (inflight) {
+        if (onReady) {
+          void inflight.then((b) => {
+            if (b) onReady(b);
+          });
+        }
+        return;
+      }
+
+      const task = (async (): Promise<string | null> => {
+        try {
+          const resp = await fetch(url);
+          if (!resp.ok) return null;
+          const len = Number(resp.headers.get('content-length') || '0');
+          if (len > 60 * 1024 * 1024) return null;
+          const blob = await resp.blob();
+          if (blob.size === 0 || blob.size > 60 * 1024 * 1024) return null;
+
+          const blobUrl = URL.createObjectURL(blob);
+          const map = blobCacheRef.current;
+          if (map.size >= 4) {
+            const oldest = Array.from(map.entries()).sort(
+              (a, b) => a[1].lastUsed - b[1].lastUsed
+            )[0];
+            if (oldest) {
+              map.delete(oldest[0]);
+              try {
+                URL.revokeObjectURL(oldest[1].blobUrl);
+              } catch {
+                // Ignore
+              }
+            }
+          }
+          map.set(cacheKey, { blobUrl, lastUsed: Date.now() });
+          onReady?.(blobUrl);
+          return blobUrl;
+        } catch {
+          // Cross-origin streams without CORS fall back cleanly to native <audio>/<video preload="auto">
+          return null;
+        } finally {
+          blobInflightRef.current.delete(cacheKey);
+        }
+      })();
+
+      blobInflightRef.current.set(cacheKey, task);
+    },
+    [getCachedBlobUrl]
+  );
+
   const resolveTrackStreams = useCallback(
     async (videoId: string, forceFresh = false): Promise<ResolvedMediaUrls> => {
       if (!forceFresh) {
         const cached = getCachedResolvedStreams(videoId);
         if (cached && (cached.audioUrl || cached.videoUrl)) {
           return cached;
+        }
+        const negUntil = negativeResolveCacheRef.current.get(videoId);
+        if (negUntil && negUntil > Date.now()) {
+          return { audioUrl: null, videoUrl: null, sourceLabel: null, botCheckBlocked: true };
         }
         const inflight = inflightResolveRef.current.get(videoId);
         if (inflight) return inflight;
@@ -571,6 +663,12 @@ export function useMediaEngine({
         let videoUrl: string | null = null;
         let sourceLabel: string | null = null;
         let botCheckBlocked = false;
+
+        // If Tier 1 recently reported cloud-IP bot blocking, race Tier 2 concurrently so 0ms is wasted
+        const tier1RecentlyBlocked = Date.now() - lastTier1BlockedAtRef.current < 60_000;
+        const earlyTier2Promise = tier1RecentlyBlocked
+          ? probeClientDirectStreams(videoId).catch(() => null)
+          : null;
 
         try {
           const query = forceFresh ? '?fresh=1' : '';
@@ -587,6 +685,9 @@ export function useMediaEngine({
             audioUrl = meta.audioAvailable ? meta.audioUrl || null : null;
             videoUrl = meta.videoAvailable ? meta.videoUrl || null : null;
             botCheckBlocked = Boolean(meta.botCheckBlocked);
+            if (botCheckBlocked && !audioUrl && !videoUrl) {
+              lastTier1BlockedAtRef.current = Date.now();
+            }
             if (audioUrl || videoUrl) {
               sourceLabel = meta.videoQuality
                 ? `Luồng gốc không quảng cáo (${meta.videoQuality})`
@@ -598,7 +699,9 @@ export function useMediaEngine({
         }
 
         if (!audioUrl && !videoUrl) {
-          const clientResolved = await probeClientDirectStreams(videoId, forceFresh);
+          const clientResolved = earlyTier2Promise
+            ? await earlyTier2Promise
+            : await probeClientDirectStreams(videoId);
           if (clientResolved) {
             audioUrl = clientResolved.audioUrl;
             videoUrl = clientResolved.videoUrl;
@@ -608,10 +711,13 @@ export function useMediaEngine({
 
         const result: ResolvedMediaUrls = { audioUrl, videoUrl, sourceLabel, botCheckBlocked };
         if (audioUrl || videoUrl) {
+          negativeResolveCacheRef.current.delete(videoId);
           streamCacheRef.current.set(videoId, {
             resolved: result,
             expiresAt: Date.now() + 15 * 60_000,
           });
+        } else if (!forceFresh) {
+          negativeResolveCacheRef.current.set(videoId, Date.now() + 25_000);
         }
         return result;
       })();
@@ -636,6 +742,8 @@ export function useMediaEngine({
       const candidates = tracks.slice(0, limit).filter((t) => {
         if (getCachedResolvedStreams(t.id)) return false;
         if (inflightResolveRef.current.has(t.id)) return false;
+        const negUntil = negativeResolveCacheRef.current.get(t.id);
+        if (negUntil && negUntil > now) return false;
         const lastTried = prefetchAttemptedRef.current.get(t.id);
         if (lastTried && now - lastTried < 30_000) return false;
         return true;
@@ -644,15 +752,19 @@ export function useMediaEngine({
       for (const t of candidates) {
         prefetchAttemptedRef.current.set(t.id, now);
       }
-      void (async () => {
-        for (const t of candidates) {
-          if (!getCachedResolvedStreams(t.id)) {
-            await resolveTrackStreams(t.id).catch(() => null);
+      void Promise.allSettled(
+        candidates.map(async (t) => {
+          const resolved = await resolveTrackStreams(t.id).catch(() => null);
+          if (resolved?.audioUrl) {
+            preloadMediaBlob(`audio:${t.id}`, resolved.audioUrl);
           }
-        }
-      })();
+          if (limit === 1 && stateRef.current.playMode === 'video' && resolved?.videoUrl) {
+            preloadMediaBlob(`video:${t.id}`, resolved.videoUrl);
+          }
+        })
+      );
     },
-    [getCachedResolvedStreams, resolveTrackStreams]
+    [getCachedResolvedStreams, preloadMediaBlob, resolveTrackStreams]
   );
 
   const recoverPlaybackRef = useRef<(reason: string) => Promise<void>>(async () => {});
@@ -803,7 +915,10 @@ export function useMediaEngine({
       }
       setActiveEngine('native-audio');
 
-      const effectiveUrl = forceReload ? appendCacheBusterIfLocal(url) || url : url;
+      const trackId = currentTrackRef.current?.id;
+      const cachedBlob = !forceReload && trackId ? getCachedBlobUrl(`audio:${trackId}`) : null;
+      const effectiveUrl =
+        cachedBlob || (forceReload ? appendCacheBusterIfLocal(url) || url : url);
       const currentAttrUrl = audio.getAttribute('data-stream-url');
       const needsLoad =
         forceReload ||
@@ -817,6 +932,9 @@ export function useMediaEngine({
         audio.setAttribute('data-stream-url', effectiveUrl);
         audio.src = effectiveUrl;
         audio.load();
+      }
+      if (trackId && !cachedBlob) {
+        preloadMediaBlob(`audio:${trackId}`, url);
       }
       audio.playbackRate = stateRef.current.playbackRate;
       audio.volume = stateRef.current.isMuted ? 0 : stateRef.current.volume;
@@ -886,7 +1004,7 @@ export function useMediaEngine({
         setIsLoading(false);
       }
     },
-    [clearStallWatchdog, scheduleStallWatchdog]
+    [clearStallWatchdog, getCachedBlobUrl, preloadMediaBlob, scheduleStallWatchdog]
   );
 
   const startNativeVideo = useCallback(
@@ -905,17 +1023,39 @@ export function useMediaEngine({
       }
       setActiveEngine('native-video');
 
-      // Pre-load full audio buffer in foreground so iOS screen-off handoff plays synchronously without rejection
+      // Pre-load FULL audio data into local Blob + <audio> buffer in foreground so iOS screen-off plays 100% smoothly
+      const trackId = currentTrackRef.current?.id;
       const bgAudio = audioRef.current;
       const bgAudioUrl = mediaUrlsRef.current.audioUrl;
-      if (bgAudio && bgAudioUrl && bgAudio.getAttribute('data-stream-url') !== bgAudioUrl) {
+      const cachedAudioBlob = trackId ? getCachedBlobUrl(`audio:${trackId}`) : null;
+      const targetBgSrc = cachedAudioBlob || bgAudioUrl;
+      if (bgAudio && targetBgSrc && bgAudio.getAttribute('data-stream-url') !== targetBgSrc) {
         bgAudio.preload = 'auto';
-        bgAudio.setAttribute('data-stream-url', bgAudioUrl);
-        bgAudio.src = bgAudioUrl;
+        bgAudio.setAttribute('data-stream-url', targetBgSrc);
+        bgAudio.src = targetBgSrc;
         bgAudio.load();
       }
+      if (trackId && bgAudioUrl && !cachedAudioBlob) {
+        preloadMediaBlob(`audio:${trackId}`, bgAudioUrl, (blobUrl) => {
+          const el = audioRef.current;
+          if (
+            el &&
+            el.paused &&
+            !document.hidden &&
+            currentTrackRef.current?.id === trackId &&
+            stateRef.current.activeEngine === 'native-video'
+          ) {
+            el.preload = 'auto';
+            el.setAttribute('data-stream-url', blobUrl);
+            el.src = blobUrl;
+            el.load();
+          }
+        });
+      }
 
-      const effectiveUrl = forceReload ? appendCacheBusterIfLocal(url) || url : url;
+      const cachedVideoBlob = !forceReload && trackId ? getCachedBlobUrl(`video:${trackId}`) : null;
+      const effectiveUrl =
+        cachedVideoBlob || (forceReload ? appendCacheBusterIfLocal(url) || url : url);
       const needsLoad =
         forceReload ||
         video.getAttribute('data-stream-url') !== effectiveUrl ||
@@ -923,9 +1063,13 @@ export function useMediaEngine({
         Boolean(video.error);
 
       if (needsLoad) {
+        video.preload = 'auto';
         video.setAttribute('data-stream-url', effectiveUrl);
         video.src = effectiveUrl;
         video.load();
+      }
+      if (trackId && !cachedVideoBlob) {
+        preloadMediaBlob(`video:${trackId}`, url);
       }
       video.playbackRate = stateRef.current.playbackRate;
       video.volume = stateRef.current.isMuted ? 0 : stateRef.current.volume;
@@ -986,7 +1130,7 @@ export function useMediaEngine({
         };
       }
     },
-    [clearStallWatchdog, scheduleStallWatchdog]
+    [clearStallWatchdog, getCachedBlobUrl, preloadMediaBlob, scheduleStallWatchdog]
   );
 
   // Persistent singleton YT.Player fallback when both Tier-1 server and Tier-2 browser streams are blocked
@@ -1305,14 +1449,10 @@ export function useMediaEngine({
 
       if (document.hidden) {
         const isInPiP = document.pictureInPictureElement === video;
-        const webkitVideo = video as unknown as { webkitPresentationMode?: string };
-        const isVideoFullscreen =
-          document.fullscreenElement === video || webkitVideo.webkitPresentationMode === 'fullscreen';
         if (
           stateRef.current.activeEngine === 'native-video' &&
           userWantsPlayingRef.current &&
           !isInPiP &&
-          !isVideoFullscreen &&
           (audioUrl || videoUrl)
         ) {
           const resumeAt = Math.max(video.currentTime || 0, lastKnownTimeRef.current || 0);
@@ -1321,8 +1461,19 @@ export function useMediaEngine({
           video.pause();
 
           const targetAudioUrl = (audioUrl || videoUrl)!;
-          if (audio.getAttribute('data-stream-url') === targetAudioUrl && audio.readyState >= 1) {
-            // Synchronous handoff inside visibilitychange so iOS Safari / Android Chrome keep audio alive
+          const currentAttr = audio.getAttribute('data-stream-url') || '';
+          const trackId = currentTrackRef.current?.id;
+          const cachedBlob = trackId ? getCachedBlobUrl(`audio:${trackId}`) : null;
+          const isPrepared =
+            audio.readyState >= 1 &&
+            Boolean(currentAttr) &&
+            !currentAttr.startsWith('data:audio/wav') &&
+            (currentAttr === targetAudioUrl ||
+              (Boolean(cachedBlob) && currentAttr === cachedBlob) ||
+              currentAttr.startsWith('blob:'));
+
+          if (isPrepared) {
+            // Synchronous handoff inside visibilitychange so iOS Safari / Android Chrome keep audio alive in 1 tap
             setActiveEngine('native-audio');
             audio.playbackRate = stateRef.current.playbackRate;
             audio.volume = stateRef.current.isMuted ? 0 : stateRef.current.volume;
@@ -1332,6 +1483,9 @@ export function useMediaEngine({
               } catch {
                 // Ignore
               }
+            }
+            if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+              navigator.mediaSession.playbackState = 'playing';
             }
             audio
               .play()
@@ -1344,7 +1498,7 @@ export function useMediaEngine({
                 void recoverPlaybackRef.current('handoff-rejected');
               });
           } else {
-            startNativeAudio(targetAudioUrl, resumeAt, true);
+            startNativeAudio(cachedBlob || targetAudioUrl, resumeAt, true);
           }
         }
         return;
@@ -1456,6 +1610,7 @@ export function useMediaEngine({
   }, [
     clearStallWatchdog,
     ensureAudioContext,
+    getCachedBlobUrl,
     scheduleStallWatchdog,
     startNativeAudio,
     startNativeVideo,
@@ -2304,26 +2459,34 @@ export function useMediaEngine({
         return;
       }
 
-      // If locked/hidden while in native-video mode (not PiP/fullscreen), hand off and call audio.play() SYNCHRONOUSLY
+      // If locked/hidden while in native-video mode (not PiP), hand off and call audio.play() SYNCHRONOUSLY
       const isInPiP = video ? document.pictureInPictureElement === video : false;
-      const webkitVideo = video as unknown as { webkitPresentationMode?: string } | null;
-      const isVideoFullscreen = video
-        ? document.fullscreenElement === video || webkitVideo?.webkitPresentationMode === 'fullscreen'
-        : false;
 
-      if (document.hidden && eng === 'native-video' && !isInPiP && !isVideoFullscreen && audio) {
+      if (document.hidden && eng === 'native-video' && !isInPiP && audio) {
         const { audioUrl, videoUrl } = mediaUrlsRef.current;
         const targetAudioUrl = audioUrl || videoUrl;
+        const trackId = currentTrackRef.current?.id;
+        const cachedBlob = trackId ? getCachedBlobUrl(`audio:${trackId}`) : null;
+        const preferredUrl = cachedBlob || targetAudioUrl;
         const resumeAt = Math.max(video?.currentTime || 0, lastKnownTimeRef.current || 0);
         lastKnownTimeRef.current = resumeAt;
         backgroundHandoffActiveRef.current = true;
         video?.pause();
         setActiveEngine('native-audio');
 
-        if (targetAudioUrl && audio.getAttribute('data-stream-url') !== targetAudioUrl) {
+        const currentAttr = audio.getAttribute('data-stream-url') || '';
+        const alreadyPrepared =
+          audio.readyState >= 1 &&
+          Boolean(currentAttr) &&
+          !currentAttr.startsWith('data:audio/wav') &&
+          (currentAttr === targetAudioUrl ||
+            (Boolean(cachedBlob) && currentAttr === cachedBlob) ||
+            currentAttr.startsWith('blob:'));
+
+        if (!alreadyPrepared && preferredUrl && currentAttr !== preferredUrl) {
           audio.preload = 'auto';
-          audio.setAttribute('data-stream-url', targetAudioUrl);
-          audio.src = targetAudioUrl;
+          audio.setAttribute('data-stream-url', preferredUrl);
+          audio.src = preferredUrl;
         }
         if (resumeAt > 0.5 && Number.isFinite(audio.duration) && resumeAt < audio.duration) {
           try {
@@ -2400,6 +2563,7 @@ export function useMediaEngine({
     clearStallWatchdog,
     currentTrack,
     ensureAudioContext,
+    getCachedBlobUrl,
     onNotice,
     playNext,
     playPrev,
