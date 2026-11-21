@@ -483,9 +483,16 @@ async function extractFromClients(
  * Extracts BOTH real direct ad-free audio/mp4 AND muxed video/mp4
  * using multi-client Innertube + BotGuard PoToken + JS player signature deciphering.
  */
-async function resolveMediaBundle(videoId: string): Promise<CachedMediaBundle> {
+async function resolveMediaBundle(
+  videoId: string,
+  forceFresh = false
+): Promise<CachedMediaBundle> {
   const cached = mediaBundleCache.get(videoId);
-  if (cached && cached.expiresAt > Date.now()) {
+  if (
+    cached &&
+    cached.expiresAt > Date.now() &&
+    (!forceFresh || Boolean(cached.audio || cached.video))
+  ) {
     return cached;
   }
 
@@ -511,7 +518,7 @@ async function resolveMediaBundle(videoId: string): Promise<CachedMediaBundle> {
       const batch2 = await extractFromClients(
         yt,
         videoId,
-        ['MWEB', 'WEB', 'WEB_EMBEDDED'],
+        ['MWEB', 'WEB', 'WEB_EMBEDDED', 'WEB_CREATOR'],
         poToken
       );
       if (!audio && batch2.audio) audio = batch2.audio;
@@ -531,7 +538,7 @@ async function resolveMediaBundle(videoId: string): Promise<CachedMediaBundle> {
     audio,
     video,
     botCheckBlocked: !audio && !video && botCheckBlocked,
-    expiresAt: Date.now() + (audio || video ? 25 * 60_000 : 2 * 60_000),
+    expiresAt: Date.now() + (audio || video ? 25 * 60_000 : 15_000),
   };
   mediaBundleCache.set(videoId, bundle);
   return bundle;
@@ -767,14 +774,15 @@ async function createApp() {
     }
   });
 
-  // Unified verified media metadata endpoint (both native audio + native video)
+  // Unified verified media metadata endpoint (both native native audio + native video)
   app.get('/api/media-meta/:id', async (req: Request, res: Response) => {
     const id = String(req.params.id || '');
     if (!/^[a-zA-Z0-9_-]{11}$/.test(id)) {
       res.status(400).json({ audioAvailable: false, videoAvailable: false });
       return;
     }
-    const bundle = await resolveMediaBundle(id);
+    const forceFresh = req.query.fresh === '1' || req.query.fresh === 'true';
+    const bundle = await resolveMediaBundle(id, forceFresh);
     res.json({
       audioAvailable: Boolean(bundle.audio),
       videoAvailable: Boolean(bundle.video),
@@ -795,7 +803,8 @@ async function createApp() {
       res.status(400).json({ available: false });
       return;
     }
-    const bundle = await resolveMediaBundle(id);
+    const forceFresh = req.query.fresh === '1' || req.query.fresh === 'true';
+    const bundle = await resolveMediaBundle(id, forceFresh);
     res.json({
       available: Boolean(bundle.audio),
       streamUrl: bundle.audio ? `/api/audio/${id}` : null,

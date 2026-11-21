@@ -103,16 +103,86 @@ const INVIDIOUS_FALLBACK_HOSTS = [
   'https://invidious.nerdvpn.de',
 ];
 
+const PLAY_MODE_STORAGE_KEY = 'musictube_play_mode';
+const HEALTHY_TIER2_STORAGE_KEY = 'musictube_healthy_tier2_hosts';
+
+function getSavedHealthyHosts(): { piped: string[]; invidious: string[] } {
+  try {
+    const raw = localStorage.getItem(HEALTHY_TIER2_STORAGE_KEY);
+    if (!raw) return { piped: [], invidious: [] };
+    const parsed = JSON.parse(raw) as { piped?: string[]; invidious?: string[] };
+    return {
+      piped: Array.isArray(parsed.piped) ? parsed.piped.filter(Boolean) : [],
+      invidious: Array.isArray(parsed.invidious) ? parsed.invidious.filter(Boolean) : [],
+    };
+  } catch {
+    return { piped: [], invidious: [] };
+  }
+}
+
+function recordHealthyHost(kind: 'piped' | 'invidious', host: string): void {
+  try {
+    const saved = getSavedHealthyHosts();
+    const list = [host, ...saved[kind].filter((h) => h !== host)].slice(0, 6);
+    saved[kind] = list;
+    localStorage.setItem(HEALTHY_TIER2_STORAGE_KEY, JSON.stringify(saved));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+let cachedPipedHosts: string[] | null = null;
+let pipedDiscoveryPromise: Promise<string[]> | null = null;
+
+async function getPipedHosts(forceRefresh = false): Promise<string[]> {
+  if (cachedPipedHosts && !forceRefresh) return cachedPipedHosts;
+  if (pipedDiscoveryPromise) return pipedDiscoveryPromise;
+
+  const saved = getSavedHealthyHosts().piped;
+  pipedDiscoveryPromise = (async () => {
+    const ctrl = new AbortController();
+    const timer = window.setTimeout(() => ctrl.abort(), 3000);
+    try {
+      const resp = await fetch('https://piped-instances.kavin.rocks/', {
+        signal: ctrl.signal,
+      });
+      if (!resp.ok) throw new Error('piped-list-failed');
+      const entries = (await resp.json()) as Array<{
+        api_url?: string;
+        up_to_date?: boolean;
+        uptime_24h?: number;
+      }>;
+      const discovered = (entries || [])
+        .filter((e) => e?.api_url?.startsWith('https://') && (e.uptime_24h ?? 100) >= 80)
+        .slice(0, 8)
+        .map((e) => e.api_url!.replace(/\/$/, ''));
+      const merged = Array.from(new Set([...saved, ...discovered, ...PIPED_HOSTS]));
+      cachedPipedHosts = merged;
+      return merged;
+    } catch {
+      const fallback = Array.from(new Set([...saved, ...PIPED_HOSTS]));
+      cachedPipedHosts = fallback;
+      return fallback;
+    } finally {
+      window.clearTimeout(timer);
+      pipedDiscoveryPromise = null;
+    }
+  })();
+
+  return pipedDiscoveryPromise;
+}
+
 let cachedInvidiousHosts: string[] | null = null;
 let invidiousDiscoveryPromise: Promise<string[]> | null = null;
 
-async function getInvidiousHosts(): Promise<string[]> {
-  if (cachedInvidiousHosts) return cachedInvidiousHosts;
+async function getInvidiousHosts(forceRefresh = false): Promise<string[]> {
+  if (cachedInvidiousHosts && !forceRefresh) return cachedInvidiousHosts;
   if (invidiousDiscoveryPromise) return invidiousDiscoveryPromise;
 
+  const saved = getSavedHealthyHosts().invidious;
   invidiousDiscoveryPromise = (async () => {
     const ctrl = new AbortController();
-    const timer = window.setTimeout(() => ctrl.abort(), 1800);
+    const timer = window.setTimeout(() => ctrl.abort(), 3000);
     try {
       const resp = await fetch('https://api.invidious.io/instances.json?sort_by=type,health', {
         signal: ctrl.signal,
@@ -123,14 +193,15 @@ async function getInvidiousHosts(): Promise<string[]> {
       >;
       const discovered = entries
         .filter(([, meta]) => meta?.type === 'https' && meta?.cors === true && meta?.api === true && meta?.uri)
-        .slice(0, 4)
+        .slice(0, 8)
         .map(([, meta]) => meta.uri!.replace(/\/$/, ''));
-      const merged = Array.from(new Set([...discovered, ...INVIDIOUS_FALLBACK_HOSTS]));
+      const merged = Array.from(new Set([...saved, ...discovered, ...INVIDIOUS_FALLBACK_HOSTS]));
       cachedInvidiousHosts = merged;
       return merged;
     } catch {
-      cachedInvidiousHosts = INVIDIOUS_FALLBACK_HOSTS;
-      return INVIDIOUS_FALLBACK_HOSTS;
+      const fallback = Array.from(new Set([...saved, ...INVIDIOUS_FALLBACK_HOSTS]));
+      cachedInvidiousHosts = fallback;
+      return fallback;
     } finally {
       window.clearTimeout(timer);
       invidiousDiscoveryPromise = null;
@@ -153,14 +224,18 @@ function isAppleTouchBrowser(): boolean {
  * when the cloud server IP is rate-limited by YouTube anti-bot checks.
  */
 async function probeClientDirectStreams(
-  videoId: string
+  videoId: string,
+  forceRefreshHosts = false
 ): Promise<{ audioUrl: string | null; videoUrl: string | null } | null> {
   const apple = isAppleTouchBrowser();
-  const invHosts = await getInvidiousHosts().catch(() => INVIDIOUS_FALLBACK_HOSTS);
+  const [pipedHosts, invHosts] = await Promise.all([
+    getPipedHosts(forceRefreshHosts).catch(() => PIPED_HOSTS),
+    getInvidiousHosts(forceRefreshHosts).catch(() => INVIDIOUS_FALLBACK_HOSTS),
+  ]);
 
-  const pipedProbes = PIPED_HOSTS.map(async (host) => {
+  const pipedProbes = pipedHosts.map(async (host) => {
     const ctrl = new AbortController();
-    const timer = window.setTimeout(() => ctrl.abort(), 2800);
+    const timer = window.setTimeout(() => ctrl.abort(), 3200);
     try {
       const r = await fetch(`${host}/streams/${videoId}`, { signal: ctrl.signal });
       if (!r.ok) throw new Error('status');
@@ -183,6 +258,7 @@ async function probeClientDirectStreams(
 
       const chosenAudioUrl = mp4Audio?.url || bestVideo?.url || anyAudio?.url || null;
       if (!chosenAudioUrl && !bestVideo?.url) throw new Error('empty');
+      recordHealthyHost('piped', host);
       return {
         audioUrl: chosenAudioUrl,
         videoUrl: bestVideo?.url || null,
@@ -194,7 +270,7 @@ async function probeClientDirectStreams(
 
   const invidiousProbes = invHosts.map(async (host) => {
     const ctrl = new AbortController();
-    const timer = window.setTimeout(() => ctrl.abort(), 3000);
+    const timer = window.setTimeout(() => ctrl.abort(), 3400);
     try {
       const r = await fetch(`${host}/api/v1/videos/${videoId}`, { signal: ctrl.signal });
       if (!r.ok) throw new Error('status');
@@ -211,6 +287,7 @@ async function probeClientDirectStreams(
 
       const chosenAudioUrl = mp4Audio?.url || bestVideo?.url || null;
       if (!chosenAudioUrl && !bestVideo?.url) throw new Error('empty');
+      recordHealthyHost('invidious', host);
       return {
         audioUrl: chosenAudioUrl,
         videoUrl: bestVideo?.url || null,
@@ -263,6 +340,12 @@ export function useMediaEngine({
   const audioMetaCleanupRef = useRef<(() => void) | null>(null);
   const videoMetaCleanupRef = useRef<(() => void) | null>(null);
 
+  const streamCacheRef = useRef<
+    Map<string, { resolved: ResolvedMediaUrls; expiresAt: number }>
+  >(new Map());
+  const inflightResolveRef = useRef<Map<string, Promise<ResolvedMediaUrls>>>(new Map());
+  const prefetchAttemptedRef = useRef<Map<string, number>>(new Map());
+
   const mediaUrlsRef = useRef<ResolvedMediaUrls>({
     audioUrl: null,
     videoUrl: null,
@@ -272,7 +355,13 @@ export function useMediaEngine({
 
   const [queue, setQueue] = useState<TrackItem[]>([]);
   const [currentIndex, setCurrentIndex] = useState<number>(-1);
-  const [playMode, setPlayMode] = useState<PlayMode>('audio');
+  const [playMode, setPlayMode] = useState<PlayMode>(() => {
+    try {
+      return localStorage.getItem(PLAY_MODE_STORAGE_KEY) === 'video' ? 'video' : 'audio';
+    } catch {
+      return 'audio';
+    }
+  });
   const [activeEngine, setActiveEngine] = useState<ActiveEngine>('native-audio');
   const [streamSourceLabel, setStreamSourceLabel] = useState<string | null>(null);
   const [isRetryingNative, setIsRetryingNative] = useState<boolean>(false);
@@ -456,47 +545,115 @@ export function useMediaEngine({
     }
   }, [clearStallWatchdog]);
 
-  const resolveTrackStreams = useCallback(async (videoId: string): Promise<ResolvedMediaUrls> => {
-    let audioUrl: string | null = null;
-    let videoUrl: string | null = null;
-    let sourceLabel: string | null = null;
-    let botCheckBlocked = false;
+  const getCachedResolvedStreams = useCallback((videoId: string): ResolvedMediaUrls | null => {
+    const entry = streamCacheRef.current.get(videoId);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+      streamCacheRef.current.delete(videoId);
+      return null;
+    }
+    return entry.resolved;
+  }, []);
 
-    try {
-      const resp = await fetch(`/api/media-meta/${videoId}`);
-      if (resp.ok) {
-        const meta = (await resp.json()) as {
-          audioAvailable?: boolean;
-          videoAvailable?: boolean;
-          audioUrl?: string | null;
-          videoUrl?: string | null;
-          videoQuality?: string | null;
-          botCheckBlocked?: boolean;
-        };
-        audioUrl = meta.audioAvailable ? meta.audioUrl || null : null;
-        videoUrl = meta.videoAvailable ? meta.videoUrl || null : null;
-        botCheckBlocked = Boolean(meta.botCheckBlocked);
+  const resolveTrackStreams = useCallback(
+    async (videoId: string, forceFresh = false): Promise<ResolvedMediaUrls> => {
+      if (!forceFresh) {
+        const cached = getCachedResolvedStreams(videoId);
+        if (cached && (cached.audioUrl || cached.videoUrl)) {
+          return cached;
+        }
+        const inflight = inflightResolveRef.current.get(videoId);
+        if (inflight) return inflight;
+      }
+
+      const task = (async (): Promise<ResolvedMediaUrls> => {
+        let audioUrl: string | null = null;
+        let videoUrl: string | null = null;
+        let sourceLabel: string | null = null;
+        let botCheckBlocked = false;
+
+        try {
+          const query = forceFresh ? '?fresh=1' : '';
+          const resp = await fetch(`/api/media-meta/${videoId}${query}`);
+          if (resp.ok) {
+            const meta = (await resp.json()) as {
+              audioAvailable?: boolean;
+              videoAvailable?: boolean;
+              audioUrl?: string | null;
+              videoUrl?: string | null;
+              videoQuality?: string | null;
+              botCheckBlocked?: boolean;
+            };
+            audioUrl = meta.audioAvailable ? meta.audioUrl || null : null;
+            videoUrl = meta.videoAvailable ? meta.videoUrl || null : null;
+            botCheckBlocked = Boolean(meta.botCheckBlocked);
+            if (audioUrl || videoUrl) {
+              sourceLabel = meta.videoQuality
+                ? `Luồng gốc không quảng cáo (${meta.videoQuality})`
+                : 'Luồng gốc không quảng cáo';
+            }
+          }
+        } catch {
+          // Proceed to Tier 2
+        }
+
+        if (!audioUrl && !videoUrl) {
+          const clientResolved = await probeClientDirectStreams(videoId, forceFresh);
+          if (clientResolved) {
+            audioUrl = clientResolved.audioUrl;
+            videoUrl = clientResolved.videoUrl;
+            sourceLabel = 'Luồng trực tiếp không quảng cáo';
+          }
+        }
+
+        const result: ResolvedMediaUrls = { audioUrl, videoUrl, sourceLabel, botCheckBlocked };
         if (audioUrl || videoUrl) {
-          sourceLabel = meta.videoQuality
-            ? `Luồng gốc không quảng cáo (${meta.videoQuality})`
-            : 'Luồng gốc không quảng cáo';
+          streamCacheRef.current.set(videoId, {
+            resolved: result,
+            expiresAt: Date.now() + 15 * 60_000,
+          });
+        }
+        return result;
+      })();
+
+      if (!forceFresh) {
+        inflightResolveRef.current.set(videoId, task);
+      }
+      try {
+        return await task;
+      } finally {
+        if (inflightResolveRef.current.get(videoId) === task) {
+          inflightResolveRef.current.delete(videoId);
         }
       }
-    } catch {
-      // Proceed to Tier 2
-    }
+    },
+    [getCachedResolvedStreams]
+  );
 
-    if (!audioUrl && !videoUrl) {
-      const clientResolved = await probeClientDirectStreams(videoId);
-      if (clientResolved) {
-        audioUrl = clientResolved.audioUrl;
-        videoUrl = clientResolved.videoUrl;
-        sourceLabel = 'Luồng trực tiếp không quảng cáo';
+  const prefetchTracks = useCallback(
+    (tracks: TrackItem[], limit = 3) => {
+      const now = Date.now();
+      const candidates = tracks.slice(0, limit).filter((t) => {
+        if (getCachedResolvedStreams(t.id)) return false;
+        if (inflightResolveRef.current.has(t.id)) return false;
+        const lastTried = prefetchAttemptedRef.current.get(t.id);
+        if (lastTried && now - lastTried < 30_000) return false;
+        return true;
+      });
+      if (candidates.length === 0) return;
+      for (const t of candidates) {
+        prefetchAttemptedRef.current.set(t.id, now);
       }
-    }
-
-    return { audioUrl, videoUrl, sourceLabel, botCheckBlocked };
-  }, []);
+      void (async () => {
+        for (const t of candidates) {
+          if (!getCachedResolvedStreams(t.id)) {
+            await resolveTrackStreams(t.id).catch(() => null);
+          }
+        }
+      })();
+    },
+    [getCachedResolvedStreams, resolveTrackStreams]
+  );
 
   const recoverPlaybackRef = useRef<(reason: string) => Promise<void>>(async () => {});
 
@@ -748,13 +905,14 @@ export function useMediaEngine({
       }
       setActiveEngine('native-video');
 
-      // Pre-warm audio stream metadata in background so screen-off handoff or lock-screen play is synchronous
+      // Pre-load full audio buffer in foreground so iOS screen-off handoff plays synchronously without rejection
       const bgAudio = audioRef.current;
       const bgAudioUrl = mediaUrlsRef.current.audioUrl;
       if (bgAudio && bgAudioUrl && bgAudio.getAttribute('data-stream-url') !== bgAudioUrl) {
-        bgAudio.preload = 'metadata';
+        bgAudio.preload = 'auto';
         bgAudio.setAttribute('data-stream-url', bgAudioUrl);
         bgAudio.src = bgAudioUrl;
+        bgAudio.load();
       }
 
       const effectiveUrl = forceReload ? appendCacheBusterIfLocal(url) || url : url;
@@ -1089,10 +1247,7 @@ export function useMediaEngine({
         if (!cancelled) setSegments([]);
       });
 
-    (async () => {
-      const resolved = await resolveTrackStreams(currentTrack.id);
-      if (cancelled) return;
-
+    const applyResolvedStreams = (resolved: ResolvedMediaUrls) => {
       mediaUrlsRef.current = resolved;
       setStreamSourceLabel(resolved.sourceLabel);
 
@@ -1112,14 +1267,22 @@ export function useMediaEngine({
       } else if (videoUrl) {
         startNativeVideo(videoUrl, 0, true);
       } else {
-        // Tier 3: Honest YouTube Privacy fallback (still runs live SponsorBlock auto-skip)
-        setStreamSourceLabel('Đang dùng iframe YouTube dự phòng (không chạy nền khi khóa máy)');
-        onNotice(
-          'Bài này đang dùng trình phát dự phòng (iframe): Safari iPhone sẽ dừng khi tắt màn hình. Bấm Phát để thử lấy lại luồng gốc.'
-        );
+        // Tier 3: Silent YouTube Privacy fallback while background auto-retry keeps probing native stream
+        setStreamSourceLabel('Nguồn dự phòng YouTube · Lọc tài trợ SponsorBlock');
         void ensureYtPlayer(currentTrack.id, 0);
       }
-    })();
+    };
+
+    const immediateCached = getCachedResolvedStreams(currentTrack.id);
+    if (immediateCached && (immediateCached.audioUrl || immediateCached.videoUrl)) {
+      applyResolvedStreams(immediateCached);
+    } else {
+      (async () => {
+        const resolved = await resolveTrackStreams(currentTrack.id);
+        if (cancelled) return;
+        applyResolvedStreams(resolved);
+      })();
+    }
 
     return () => {
       cancelled = true;
@@ -1736,49 +1899,109 @@ export function useMediaEngine({
   }, [sleepEndsAt, onNotice, stopAllEngines]);
 
   // Try upgrading from fallback yt-privacy iframe back to native background-capable stream
-  const retryNativeStream = useCallback(async (): Promise<boolean> => {
-    const track = currentTrackRef.current;
-    if (!track || isRetryingNativeRef.current) return false;
+  const retryNativeStream = useCallback(
+    async (options?: { fresh?: boolean; fromUserGesture?: boolean }): Promise<boolean> => {
+      const track = currentTrackRef.current;
+      if (!track || isRetryingNativeRef.current) return false;
 
-    unlockAudioSync();
-    isRetryingNativeRef.current = true;
-    setIsRetryingNative(true);
-
-    const trackIdAtStart = track.id;
-    const resumeAt =
-      stateRef.current.activeEngine === 'yt-privacy'
-        ? ytPlayerRef.current?.getCurrentTime?.() || lastKnownTimeRef.current || 0
-        : lastKnownTimeRef.current || 0;
-
-    try {
-      const resolved = await resolveTrackStreams(trackIdAtStart);
-      if (currentTrackRef.current?.id !== trackIdAtStart) return false;
-
-      if (resolved.audioUrl || resolved.videoUrl) {
-        mediaUrlsRef.current = resolved;
-        setStreamSourceLabel(resolved.sourceLabel);
-
-        const preferVideo =
-          stateRef.current.playMode === 'video' && !document.hidden && Boolean(resolved.videoUrl);
-        if (preferVideo && resolved.videoUrl) {
-          startNativeVideo(resolved.videoUrl, resumeAt, true, true);
-          return true;
-        }
-        const audioCandidate = resolved.audioUrl || resolved.videoUrl;
-        if (audioCandidate) {
-          startNativeAudio(audioCandidate, resumeAt, true, true);
-          return true;
-        }
+      if (options?.fromUserGesture) {
+        unlockAudioSync();
       }
-      return false;
-    } finally {
-      isRetryingNativeRef.current = false;
-      setIsRetryingNative(false);
-    }
-  }, [resolveTrackStreams, startNativeAudio, startNativeVideo, unlockAudioSync]);
+      isRetryingNativeRef.current = true;
+      setIsRetryingNative(true);
 
-  const retryNativeStreamRef = useRef<() => Promise<boolean>>(async () => false);
+      const trackIdAtStart = track.id;
+      const resumeAt =
+        stateRef.current.activeEngine === 'yt-privacy'
+          ? ytPlayerRef.current?.getCurrentTime?.() || lastKnownTimeRef.current || 0
+          : lastKnownTimeRef.current || 0;
+
+      try {
+        const resolved = await resolveTrackStreams(trackIdAtStart, options?.fresh ?? true);
+        if (currentTrackRef.current?.id !== trackIdAtStart) return false;
+
+        if (resolved.audioUrl || resolved.videoUrl) {
+          mediaUrlsRef.current = resolved;
+          setStreamSourceLabel(resolved.sourceLabel);
+
+          const shouldPlay = userWantsPlayingRef.current;
+          const preferVideo =
+            stateRef.current.playMode === 'video' && !document.hidden && Boolean(resolved.videoUrl);
+
+          if (preferVideo && resolved.videoUrl) {
+            startNativeVideo(resolved.videoUrl, resumeAt, shouldPlay, true);
+            return true;
+          }
+
+          const audioCandidate = resolved.audioUrl || resolved.videoUrl;
+          if (audioCandidate) {
+            if (stateRef.current.playMode === 'video' && document.hidden) {
+              backgroundHandoffActiveRef.current = true;
+            }
+            startNativeAudio(audioCandidate, resumeAt, shouldPlay, true);
+            return true;
+          }
+        }
+        return false;
+      } finally {
+        isRetryingNativeRef.current = false;
+        setIsRetryingNative(false);
+      }
+    },
+    [resolveTrackStreams, startNativeAudio, startNativeVideo, unlockAudioSync]
+  );
+
+  const retryNativeStreamRef = useRef<
+    (options?: { fresh?: boolean; fromUserGesture?: boolean }) => Promise<boolean>
+  >(async () => false);
   retryNativeStreamRef.current = retryNativeStream;
+
+  // Silent automatic background retry loop whenever falling back to yt-privacy (Audio & Video modes)
+  useEffect(() => {
+    if (activeEngine !== 'yt-privacy' || !currentTrack?.id) return;
+
+    let cancelled = false;
+    let timerId: number | null = null;
+    let attemptIndex = 0;
+    const RETRY_DELAYS_MS = [4000, 10000, 20000, 35000, 60000];
+
+    const runAutoRetry = async () => {
+      if (cancelled || !currentTrackRef.current) return;
+      if (stateRef.current.activeEngine !== 'yt-privacy') return;
+
+      const ok = await retryNativeStreamRef.current({ fresh: true, fromUserGesture: false });
+      if (cancelled || ok || stateRef.current.activeEngine !== 'yt-privacy') return;
+
+      const delay = RETRY_DELAYS_MS[Math.min(attemptIndex, RETRY_DELAYS_MS.length - 1)];
+      attemptIndex += 1;
+      timerId = window.setTimeout(() => {
+        void runAutoRetry();
+      }, delay);
+    };
+
+    timerId = window.setTimeout(() => {
+      void runAutoRetry();
+    }, RETRY_DELAYS_MS[0]);
+
+    const onReconnectOrWake = () => {
+      if (cancelled || stateRef.current.activeEngine !== 'yt-privacy') return;
+      if (timerId !== null) {
+        window.clearTimeout(timerId);
+        timerId = null;
+      }
+      void runAutoRetry();
+    };
+
+    window.addEventListener('online', onReconnectOrWake);
+    document.addEventListener('visibilitychange', onReconnectOrWake);
+
+    return () => {
+      cancelled = true;
+      if (timerId !== null) window.clearTimeout(timerId);
+      window.removeEventListener('online', onReconnectOrWake);
+      document.removeEventListener('visibilitychange', onReconnectOrWake);
+    };
+  }, [activeEngine, currentTrack?.id]);
 
   // Unified Transport Controls
   const togglePlay = useCallback(() => {
@@ -1886,6 +2109,11 @@ export function useMediaEngine({
       if (targetMode === playMode) return;
       unlockAudioSync();
       setPlayMode(targetMode);
+      try {
+        localStorage.setItem(PLAY_MODE_STORAGE_KEY, targetMode);
+      } catch {
+        // Ignore storage errors
+      }
       const track = currentTrackRef.current;
       if (!track) return;
 
@@ -1953,6 +2181,51 @@ export function useMediaEngine({
     }
   }, [onNotice]);
 
+  // Attempt native OS / iOS fullscreen cleanly when permitted without showing errors if blocked
+  const requestNativeVideoFullscreen = useCallback(async (): Promise<boolean> => {
+    const video = videoRef.current as
+      | (HTMLVideoElement & {
+          webkitEnterFullscreen?: () => void;
+          webkitDisplayingFullscreen?: boolean;
+        })
+      | null;
+    if (!video || stateRef.current.activeEngine !== 'native-video') return false;
+    try {
+      if (typeof video.webkitEnterFullscreen === 'function') {
+        if (!video.webkitDisplayingFullscreen) {
+          video.webkitEnterFullscreen();
+        }
+        return true;
+      }
+      if (typeof video.requestFullscreen === 'function' && !document.fullscreenElement) {
+        await video.requestFullscreen();
+        return true;
+      }
+    } catch {
+      // Async native fullscreen can be blocked by iOS/browser; in-app edge-to-edge fullscreen remains active
+    }
+    return false;
+  }, []);
+
+  const exitNativeVideoFullscreen = useCallback(() => {
+    const video = videoRef.current as
+      | (HTMLVideoElement & {
+          webkitExitFullscreen?: () => void;
+          webkitDisplayingFullscreen?: boolean;
+        })
+      | null;
+    try {
+      if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+        void document.exitFullscreen().catch(() => {});
+      }
+      if (video?.webkitDisplayingFullscreen && typeof video.webkitExitFullscreen === 'function') {
+        video.webkitExitFullscreen();
+      }
+    } catch {
+      // Ignore
+    }
+  }, []);
+
   // 1. Lock-Screen Media Session Metadata (updates only when track changes)
   useEffect(() => {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
@@ -2019,17 +2292,13 @@ export function useMediaEngine({
         if (!document.hidden) {
           ytPlayerRef.current?.playVideo?.();
         } else {
-          // iOS Safari pauses iframe playback in background; keep honest paused state until native stream succeeds
           navigator.mediaSession.playbackState = 'paused';
           setIsPlaying(false);
         }
-        void retryNativeStreamRef.current().then((ok) => {
+        void retryNativeStreamRef.current({ fresh: true, fromUserGesture: true }).then((ok) => {
           if (!ok && document.hidden) {
             navigator.mediaSession.playbackState = 'paused';
             setIsPlaying(false);
-            onNotice(
-              'Bài này đang dùng iframe dự phòng nên iPhone không thể phát khi tắt màn hình. Hãy mở app để đổi bài hoặc thử lấy luồng gốc.'
-            );
           }
         });
         return;
@@ -2314,7 +2583,10 @@ export function useMediaEngine({
     skipBy,
     switchPlayMode,
     retryNativeStream,
+    prefetchTracks,
     togglePictureInPicture,
+    requestNativeVideoFullscreen,
+    exitNativeVideoFullscreen,
     setSleepTimerMinutes,
   };
 }

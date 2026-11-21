@@ -1,6 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  AlertTriangle,
   ChevronDown,
   Headphones,
   Heart,
@@ -11,7 +10,6 @@ import {
   Pause,
   PictureInPicture2,
   Play,
-  RefreshCw,
   Repeat,
   Repeat1,
   RotateCcw,
@@ -43,7 +41,6 @@ interface PlayerPanelProps {
   playMode: PlayMode;
   activeEngine: ActiveEngine;
   streamSourceLabel: string | null;
-  isRetryingNative?: boolean;
   isPiPSupported: boolean;
   isPlaying: boolean;
   isLoading: boolean;
@@ -69,7 +66,6 @@ interface PlayerPanelProps {
   onSeek: (seconds: number) => void;
   onSkipBy: (delta: number) => void;
   onSwitchPlayMode: (mode: PlayMode) => void;
-  onRetryNativeStream?: () => void;
   onTogglePiP: () => void;
   onVolumeChange: (val: number) => void;
   onToggleMute: () => void;
@@ -92,7 +88,6 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
   playMode,
   activeEngine,
   streamSourceLabel,
-  isRetryingNative = false,
   isPiPSupported,
   isPlaying,
   isLoading,
@@ -118,7 +113,6 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
   onSeek,
   onSkipBy,
   onSwitchPlayMode,
-  onRetryNativeStream,
   onTogglePiP,
   onVolumeChange,
   onToggleMute,
@@ -397,33 +391,6 @@ export const PlayerPanel: React.FC<PlayerPanelProps> = ({
                 </button>
               </div>
             </div>
-
-            {/* Clear inline warning when falling back to YouTube iframe */}
-            {activeEngine === 'yt-privacy' && (
-              <div className="mt-3.5 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs text-amber-900 dark:text-amber-200">
-                <div className="flex min-w-0 flex-1 items-start gap-2">
-                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
-                  <p className="leading-relaxed">
-                    Đang phát qua iframe dự phòng: iPhone Safari sẽ tạm dừng khi tắt màn hình.
-                  </p>
-                </div>
-                {onRetryNativeStream && (
-                  <button
-                    type="button"
-                    disabled={isRetryingNative}
-                    onClick={onRetryNativeStream}
-                    className="inline-flex min-h-[44px] shrink-0 items-center gap-1.5 rounded-lg bg-amber-600 px-3 py-2 text-xs font-semibold text-white hover:bg-amber-700 disabled:opacity-60 transition-colors whitespace-nowrap"
-                  >
-                    {isRetryingNative ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <RefreshCw className="h-3.5 w-3.5" />
-                    )}
-                    <span>{isRetryingNative ? 'Đang thử...' : 'Thử lấy luồng gốc'}</span>
-                  </button>
-                )}
-              </div>
-            )}
           </div>
 
           {/* Controls Block */}

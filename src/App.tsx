@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Compass,
   Library,
+  Loader2,
+  Minimize2,
   Moon,
   RefreshCw,
   Search,
@@ -19,7 +21,7 @@ import { SettingsView } from './components/SettingsView';
 import { TrackRow } from './components/TrackRow';
 import { useLibrary } from './hooks/useLibrary';
 import { useMediaEngine } from './hooks/useMediaEngine';
-import type { NavTab, TrackItem } from './types/media';
+import type { NavTab, PlayMode, TrackItem } from './types/media';
 
 const DISCOVER_CATEGORIES = [
   { id: 'trending', label: 'Thịnh hành' },
@@ -54,14 +56,16 @@ export default function App() {
   const [searchError, setSearchError] = useState<string | null>(null);
 
   const [mobilePlayerOpen, setMobilePlayerOpen] = useState<boolean>(false);
+  const [videoFullscreen, setVideoFullscreen] = useState<boolean>(false);
   const [desktopVideoRect, setDesktopVideoRect] = useState<DOMRect | null>(null);
   const [mobileVideoRect, setMobileVideoRect] = useState<DOMRect | null>(null);
+  const [fullscreenVideoRect, setFullscreenVideoRect] = useState<DOMRect | null>(null);
   const [playlistModalTrack, setPlaylistModalTrack] = useState<TrackItem | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const toastTimerRef = useRef<number | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
-
-  const activeVideoRect = mobilePlayerOpen ? mobileVideoRect : desktopVideoRect;
+  const fullscreenSlotRef = useRef<HTMLDivElement | null>(null);
+  const nativeFullscreenAttemptedRef = useRef<string | null>(null);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -88,6 +92,112 @@ export default function App() {
     onNotice: showToast,
   });
 
+  const {
+    activeEngine,
+    currentIndex,
+    currentTrack,
+    exitNativeVideoFullscreen,
+    playMode,
+    playTrack,
+    prefetchTracks,
+    queue,
+    requestNativeVideoFullscreen,
+    switchPlayMode,
+    togglePlay,
+    videoRef,
+  } = engine;
+
+  const isVideoFullscreenActive = Boolean(
+    videoFullscreen && playMode === 'video' && currentTrack
+  );
+  const activeVideoRect = isVideoFullscreenActive
+    ? fullscreenVideoRect
+    : mobilePlayerOpen
+    ? mobileVideoRect
+    : desktopVideoRect;
+
+  const handleExitVideoFullscreen = useCallback(() => {
+    setVideoFullscreen(false);
+    exitNativeVideoFullscreen();
+  }, [exitNativeVideoFullscreen]);
+
+  // Automatically close video fullscreen if user switches to audio mode or clears queue
+  useEffect(() => {
+    if (engine.playMode !== 'video' || !engine.currentTrack) {
+      setVideoFullscreen(false);
+      nativeFullscreenAttemptedRef.current = null;
+    }
+  }, [engine.playMode, engine.currentTrack]);
+
+  // Track edge-to-edge fullscreen viewport rect so persistent <video>/YT iframe expands with 0ms reload
+  useEffect(() => {
+    if (!isVideoFullscreenActive || !fullscreenSlotRef.current) {
+      setFullscreenVideoRect(null);
+      return;
+    }
+    const update = () => {
+      const el = fullscreenSlotRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      setFullscreenVideoRect(rect.width > 0 && rect.height > 0 ? rect : null);
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(fullscreenSlotRef.current);
+    window.addEventListener('resize', update);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', update);
+      setFullscreenVideoRect(null);
+    };
+  }, [isVideoFullscreenActive]);
+
+  // Attempt native iOS/OS video fullscreen at earliest metadata readiness while gesture token may still be warm
+  useEffect(() => {
+    if (!isVideoFullscreenActive || !currentTrack) return;
+    if (activeEngine !== 'native-video') return;
+    const trackId = currentTrack.id;
+    const videoEl = videoRef.current;
+    if (!videoEl) return;
+
+    const tryNativeFs = () => {
+      if (nativeFullscreenAttemptedRef.current === trackId) return;
+      if (videoEl.readyState < 1) return;
+      nativeFullscreenAttemptedRef.current = trackId;
+      void requestNativeVideoFullscreen();
+    };
+
+    if (videoEl.readyState >= 1) {
+      tryNativeFs();
+      return;
+    }
+
+    videoEl.addEventListener('loadedmetadata', tryNativeFs);
+    return () => {
+      videoEl.removeEventListener('loadedmetadata', tryNativeFs);
+    };
+  }, [activeEngine, currentTrack, isVideoFullscreenActive, requestNativeVideoFullscreen, videoRef]);
+
+  // Sync Escape key and iOS native fullscreen dismissal cleanly
+  useEffect(() => {
+    if (!isVideoFullscreenActive) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        handleExitVideoFullscreen();
+      }
+    };
+    const videoEl = engine.videoRef.current;
+    const onWebkitEndFullscreen = () => {
+      setVideoFullscreen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    videoEl?.addEventListener('webkitendfullscreen', onWebkitEndFullscreen);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      videoEl?.removeEventListener('webkitendfullscreen', onWebkitEndFullscreen);
+    };
+  }, [engine.videoRef, handleExitVideoFullscreen, isVideoFullscreenActive]);
+
   // Load Discover tracks by category
   const fetchDiscover = useCallback(async (category: string) => {
     setDiscoverLoading(true);
@@ -109,6 +219,26 @@ export default function App() {
   useEffect(() => {
     void fetchDiscover(discoverCategory);
   }, [discoverCategory, fetchDiscover]);
+
+  // Prefetch top tracks in background so tapping in Video mode starts instantaneously
+  useEffect(() => {
+    if (discoverTracks.length > 0) {
+      prefetchTracks(discoverTracks, 3);
+    }
+  }, [discoverTracks, prefetchTracks]);
+
+  useEffect(() => {
+    if (searchTracks.length > 0) {
+      prefetchTracks(searchTracks, 3);
+    }
+  }, [prefetchTracks, searchTracks]);
+
+  useEffect(() => {
+    const nextTrack = queue[currentIndex + 1];
+    if (nextTrack) {
+      prefetchTracks([nextTrack], 1);
+    }
+  }, [currentIndex, prefetchTracks, queue]);
 
   // Execute search on YouTube (keywords or pasted URL)
   const runSearch = useCallback(
@@ -134,9 +264,11 @@ export default function App() {
         // If user pasted a direct YouTube link (single exact match), auto-play immediately
         const looksLikeUrl = /youtu(\.be|be\.com)/i.test(q);
         if (looksLikeUrl && results.length === 1) {
-          engine.playTrack(results[0], results);
-          if (engine.playMode === 'video') {
+          nativeFullscreenAttemptedRef.current = null;
+          playTrack(results[0], results);
+          if (playMode === 'video') {
             setMobilePlayerOpen(true);
+            setVideoFullscreen(true);
           }
           showToast('Đã nhận diện liên kết YouTube — đang phát không quảng cáo.');
         }
@@ -146,7 +278,7 @@ export default function App() {
         setSearchLoading(false);
       }
     },
-    [engine, library, showToast]
+    [library, playMode, playTrack, showToast]
   );
 
   const handleSearchSubmit = (e: React.FormEvent) => {
@@ -160,9 +292,9 @@ export default function App() {
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
 
-      if (e.code === 'Space' && engine.currentTrack) {
+      if (e.code === 'Space' && currentTrack) {
         e.preventDefault();
-        engine.togglePlay();
+        togglePlay();
       } else if (e.key === '/') {
         e.preventDefault();
         setActiveTab('search');
@@ -171,16 +303,31 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [engine]);
+  }, [currentTrack, togglePlay]);
 
   const handleSelectTrack = useCallback(
     (track: TrackItem, list?: TrackItem[]) => {
-      engine.playTrack(track, list);
-      if (engine.playMode === 'video') {
+      nativeFullscreenAttemptedRef.current = null;
+      playTrack(track, list);
+      if (playMode === 'video') {
         setMobilePlayerOpen(true);
+        setVideoFullscreen(true);
       }
     },
-    [engine]
+    [playMode, playTrack]
+  );
+
+  const handleSwitchPlayMode = useCallback(
+    (mode: PlayMode) => {
+      nativeFullscreenAttemptedRef.current = null;
+      switchPlayMode(mode);
+      if (mode === 'video' && currentTrack) {
+        setVideoFullscreen(true);
+      } else if (mode === 'audio') {
+        setVideoFullscreen(false);
+      }
+    },
+    [currentTrack, switchPlayMode]
   );
 
   const navItems: Array<{ id: NavTab; label: string; icon: React.FC<{ className?: string }> }> = [
@@ -594,7 +741,6 @@ export default function App() {
           playMode={engine.playMode}
           activeEngine={engine.activeEngine}
           streamSourceLabel={engine.streamSourceLabel}
-          isRetryingNative={engine.isRetryingNative}
           isPiPSupported={engine.isPiPSupported}
           isPlaying={engine.isPlaying}
           isLoading={engine.isLoading}
@@ -617,16 +763,7 @@ export default function App() {
           onPrev={engine.playPrev}
           onSeek={engine.seekTo}
           onSkipBy={engine.skipBy}
-          onSwitchPlayMode={engine.switchPlayMode}
-          onRetryNativeStream={() => {
-            void engine.retryNativeStream().then((ok) => {
-              showToast(
-                ok
-                  ? 'Đã chuyển sang luồng gốc — hỗ trợ tắt màn hình.'
-                  : 'Chưa lấy được luồng gốc từ máy chủ hoặc mạng hiện tại.'
-              );
-            });
-          }}
+          onSwitchPlayMode={handleSwitchPlayMode}
           onTogglePiP={() => void engine.togglePictureInPicture()}
           onVolumeChange={(v) => {
             engine.setVolume(v);
@@ -639,7 +776,13 @@ export default function App() {
           onSetSleepTimer={engine.setSleepTimerMinutes}
           onToggleFavorite={() => engine.currentTrack && library.toggleFavorite(engine.currentTrack)}
           onOpenPlaylistModal={setPlaylistModalTrack}
-          onSelectQueueIndex={engine.selectQueueIndex}
+          onSelectQueueIndex={(idx) => {
+            nativeFullscreenAttemptedRef.current = null;
+            engine.selectQueueIndex(idx);
+            if (engine.playMode === 'video') {
+              setVideoFullscreen(true);
+            }
+          }}
           onRemoveFromQueue={engine.removeFromQueue}
         />
       </aside>
@@ -657,7 +800,6 @@ export default function App() {
             playMode={engine.playMode}
             activeEngine={engine.activeEngine}
             streamSourceLabel={engine.streamSourceLabel}
-            isRetryingNative={engine.isRetryingNative}
             isPiPSupported={engine.isPiPSupported}
             isPlaying={engine.isPlaying}
             isLoading={engine.isLoading}
@@ -679,16 +821,7 @@ export default function App() {
             onPrev={engine.playPrev}
             onSeek={engine.seekTo}
             onSkipBy={engine.skipBy}
-            onSwitchPlayMode={engine.switchPlayMode}
-            onRetryNativeStream={() => {
-              void engine.retryNativeStream().then((ok) => {
-                showToast(
-                  ok
-                    ? 'Đã chuyển sang luồng gốc — hỗ trợ tắt màn hình.'
-                    : 'Chưa lấy được luồng gốc từ máy chủ hoặc mạng hiện tại.'
-                );
-              });
-            }}
+            onSwitchPlayMode={handleSwitchPlayMode}
             onTogglePiP={() => void engine.togglePictureInPicture()}
             onVolumeChange={engine.setVolume}
             onToggleMute={() => engine.setIsMuted((m) => !m)}
@@ -698,9 +831,50 @@ export default function App() {
             onSetSleepTimer={engine.setSleepTimerMinutes}
             onToggleFavorite={() => engine.currentTrack && library.toggleFavorite(engine.currentTrack)}
             onOpenPlaylistModal={setPlaylistModalTrack}
-            onSelectQueueIndex={engine.selectQueueIndex}
+            onSelectQueueIndex={(idx) => {
+              nativeFullscreenAttemptedRef.current = null;
+              engine.selectQueueIndex(idx);
+              if (engine.playMode === 'video') {
+                setVideoFullscreen(true);
+              }
+            }}
             onRemoveFromQueue={engine.removeFromQueue}
           />
+        </div>
+      )}
+
+      {/* Auto Edge-to-Edge Fullscreen Video Stage (instant 0ms on track select in Video mode) */}
+      {isVideoFullscreenActive && engine.currentTrack && (
+        <div
+          className="fixed inset-0 z-[48] bg-black"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Trình phát video toàn màn hình"
+        >
+          <div ref={fullscreenSlotRef} className="h-full w-full" />
+          {(engine.isLoading ||
+            (engine.activeEngine !== 'native-video' && engine.activeEngine !== 'yt-privacy')) && (
+            <div className="pointer-events-none fixed inset-0 z-[50] flex items-center justify-center bg-black">
+              <img
+                src={engine.currentTrack.thumbnail}
+                alt={engine.currentTrack.title}
+                referrerPolicy="no-referrer"
+                className="max-h-full max-w-full object-contain opacity-35"
+              />
+              <div className="absolute inset-0 flex items-center justify-center">
+                <Loader2 className="h-9 w-9 animate-spin text-white" />
+              </div>
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={handleExitVideoFullscreen}
+            aria-label="Thu gọn video toàn màn hình"
+            style={{ top: 'calc(env(safe-area-inset-top, 0px) + 12px)' }}
+            className="fixed left-4 z-[60] flex h-11 w-11 items-center justify-center rounded-full bg-black/65 text-white ring-1 ring-white/25 backdrop-blur-md hover:bg-black/85 active:scale-95 transition-all"
+          >
+            <Minimize2 className="h-5 w-5" />
+          </button>
         </div>
       )}
 
@@ -717,11 +891,14 @@ export default function App() {
         ref={engine.videoRef}
         playsInline
         preload="auto"
-        onClick={engine.togglePlay}
+        controls={isVideoFullscreenActive}
+        onClick={isVideoFullscreenActive ? undefined : engine.togglePlay}
         aria-hidden={!(activeVideoRect && engine.playMode === 'video' && engine.activeEngine === 'native-video')}
         className={
           activeVideoRect && engine.playMode === 'video' && engine.activeEngine === 'native-video'
-            ? 'fixed z-[45] overflow-hidden rounded-2xl bg-black object-contain cursor-pointer'
+            ? isVideoFullscreenActive
+              ? 'fixed z-[55] overflow-hidden bg-black object-contain'
+              : 'fixed z-[45] overflow-hidden rounded-2xl bg-black object-contain cursor-pointer'
             : 'fixed left-0 top-0 z-0 h-1 w-1 pointer-events-none'
         }
         style={
@@ -742,7 +919,9 @@ export default function App() {
         aria-hidden={!(activeVideoRect && engine.playMode === 'video' && engine.activeEngine === 'yt-privacy')}
         className={
           activeVideoRect && engine.playMode === 'video' && engine.activeEngine === 'yt-privacy'
-            ? 'fixed z-[45] overflow-hidden rounded-2xl bg-black'
+            ? isVideoFullscreenActive
+              ? 'fixed z-[55] overflow-hidden bg-black'
+              : 'fixed z-[45] overflow-hidden rounded-2xl bg-black'
             : activeVideoRect && engine.playMode === 'audio' && engine.activeEngine === 'yt-privacy'
             ? 'fixed z-0 overflow-hidden rounded-2xl bg-black pointer-events-none'
             : 'fixed left-0 top-0 z-0 h-4 w-4 overflow-hidden pointer-events-none'
@@ -769,7 +948,13 @@ export default function App() {
               isLoading={engine.isLoading}
               currentTime={engine.currentTime}
               duration={engine.duration}
-              onExpand={() => setMobilePlayerOpen(true)}
+              onExpand={() => {
+                setMobilePlayerOpen(true);
+                if (engine.playMode === 'video') {
+                  nativeFullscreenAttemptedRef.current = null;
+                  setVideoFullscreen(true);
+                }
+              }}
               onTogglePlay={engine.togglePlay}
               onNext={engine.playNext}
             />
